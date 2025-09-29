@@ -17,6 +17,12 @@ use std::sync::{Arc, Mutex};
 pub const AGG_TYPE_REGULAR: u8 = 0b00; // COUNT/SUM/AVG
 pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
 
+const METADATA_ELEMENT_ID: i64 = -1;
+
+fn metadata_hash() -> Hash128 {
+    Hash128::new(0, 0)
+}
+
 // Serialization type codes for aggregate functions
 const AGG_FUNC_COUNT: i64 = 0;
 const AGG_FUNC_SUM: i64 = 1;
@@ -188,6 +194,12 @@ type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>;
 // group_key_str -> (column_index, value_as_hashable_row) -> accumulated_weight
 pub type MinMaxDeltas = HashMap<String, HashMap<(usize, HashableRow), isize>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct OldRowData {
+    rowid: Option<i64>,
+    values: Vec<Value>,
+}
+
 #[derive(Debug)]
 enum AggregateCommitState {
     Idle,
@@ -205,6 +217,10 @@ enum AggregateCommitState {
         delta: Delta,
         min_max_persist_state: MinMaxPersistState,
     },
+    PersistMetadata {
+        delta: Delta,
+        write_row: WriteRow,
+    },
     Done {
         delta: Delta,
     },
@@ -219,21 +235,21 @@ pub enum AggregateEvalState {
         current_idx: usize,
         groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
         existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
+        old_values: HashMap<String, OldRowData>,
     },
     FetchData {
         delta: Delta, // Keep original delta for merge operation
         current_idx: usize,
         groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
         existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
+        old_values: HashMap<String, OldRowData>,
         rowid: Option<i64>, // Rowid found by FetchKey (None if not found)
         read_record_state: Box<ReadRecord>,
     },
     RecomputeMinMax {
         delta: Delta,
         existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
+        old_values: HashMap<String, OldRowData>,
         recompute_state: Box<RecomputeMinMax>,
     },
     Done {
@@ -256,6 +272,10 @@ pub struct AggregateOperator {
     pub input_column_names: Vec<String>,
     // Map from column index to aggregate info for quick lookup
     pub column_min_max: HashMap<usize, AggColumnInfo>,
+    next_rowid: i64,
+    metadata_initialized: bool,
+    metadata_dirty: bool,
+    metadata_exists: bool,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     // State machine for commit operation
@@ -265,6 +285,7 @@ pub struct AggregateOperator {
 /// State for a single group's aggregates
 #[derive(Debug, Clone, Default)]
 pub struct AggregateState {
+    pub rowid: Option<i64>,
     // For COUNT: just the count
     pub count: i64,
     // For SUM: column_index -> sum value
@@ -383,7 +404,13 @@ impl AggregateEvalState {
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
                             old_row.extend(state.to_values(&operator.aggregates));
-                            old_values.insert(group_key_str.clone(), old_row);
+                            old_values.insert(
+                                group_key_str.clone(),
+                                OldRowData {
+                                    rowid: state.rowid,
+                                    values: old_row,
+                                },
+                            );
                             existing_groups.insert(group_key_str.clone(), state.clone());
                         }
                     } else {
@@ -442,6 +469,11 @@ impl AggregateState {
     pub fn to_value_vector(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
         let mut values = Vec::new();
 
+        if let Some(rowid) = self.rowid {
+            values.push(Value::Integer(-1));
+            values.push(Value::Integer(rowid));
+        }
+
         // Include count first
         values.push(Value::Integer(self.count));
 
@@ -493,6 +525,21 @@ impl AggregateState {
     pub fn from_value_vector(values: &[Value]) -> Result<Self> {
         let mut cursor = 0;
         let mut state = Self::new();
+
+        if let Some(Value::Integer(-1)) = values.get(cursor) {
+            cursor += 1;
+            let rowid_value = values.get(cursor).ok_or_else(|| {
+                LimboError::InternalError("Missing rowid in aggregate state".into())
+            })?;
+            if let Value::Integer(rowid) = rowid_value {
+                state.rowid = Some(*rowid);
+            } else {
+                return Err(LimboError::InternalError(format!(
+                    "Expected Integer for rowid, got {rowid_value:?}"
+                )));
+            }
+            cursor += 1;
+        }
 
         // Read count
         let count = values
@@ -851,6 +898,10 @@ impl AggregateOperator {
             aggregates,
             input_column_names,
             column_min_max,
+            next_rowid: 1,
+            metadata_initialized: false,
+            metadata_dirty: false,
+            metadata_exists: false,
             tracker: None,
             commit_state: AggregateCommitState::Idle,
         }
@@ -865,6 +916,8 @@ impl AggregateOperator {
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<(Delta, ComputedStates)>> {
+        return_if_io!(self.load_metadata_if_needed(cursors));
+
         match state {
             EvalState::Uninitialized => {
                 panic!("Cannot eval AggregateOperator with Uninitialized state");
@@ -922,7 +975,7 @@ impl AggregateOperator {
         &mut self,
         delta: &Delta,
         existing_groups: &mut HashMap<String, AggregateState>,
-        old_values: &mut HashMap<String, Vec<Value>>,
+        old_values: &mut HashMap<String, OldRowData>,
     ) -> (Delta, HashMap<String, (Vec<Value>, AggregateState)>) {
         let mut output_delta = Delta::new();
         let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
@@ -956,11 +1009,20 @@ impl AggregateOperator {
         for (group_key_str, state) in existing_groups {
             let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
 
-            // Generate synthetic rowid for this group
-            let result_key = self.generate_group_rowid(group_key_str);
+            let rowid = match state.rowid {
+                Some(id) => id,
+                None => {
+                    let id = self.allocate_rowid();
+                    state.rowid = Some(id);
+                    id
+                }
+            };
 
             if let Some(old_row_values) = old_values.get(group_key_str) {
-                let old_row = HashableRow::new(result_key, old_row_values.clone());
+                let delete_rowid = old_row_values
+                    .rowid
+                    .unwrap_or_else(|| self.generate_group_rowid(group_key_str));
+                let old_row = HashableRow::new(delete_rowid, old_row_values.values.clone());
                 output_delta.changes.push((old_row, -1));
             }
 
@@ -974,7 +1036,7 @@ impl AggregateOperator {
                 let aggregate_values = state.to_values(&self.aggregates);
                 output_values.extend(aggregate_values);
 
-                let output_row = HashableRow::new(result_key, output_values.clone());
+                let output_row = HashableRow::new(rowid, output_values.clone());
                 output_delta.changes.push((output_row, 1));
             }
         }
@@ -1064,6 +1126,104 @@ impl AggregateOperator {
             .map(|v| format!("{v:?}"))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    fn allocate_rowid(&mut self) -> i64 {
+        let rowid = self.next_rowid;
+        self.next_rowid += 1;
+        self.metadata_dirty = true;
+        rowid
+    }
+
+    fn metadata_index_key(&self) -> Vec<Value> {
+        vec![
+            Value::Integer(generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR)),
+            metadata_hash().to_value(),
+            Value::Integer(METADATA_ELEMENT_ID),
+        ]
+    }
+
+    fn metadata_record_values(&self) -> Vec<Value> {
+        let storage_id = generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
+        let record = ImmutableRecord::from_values(&[Value::Integer(self.next_rowid)], 1);
+        vec![
+            Value::Integer(storage_id),
+            metadata_hash().to_value(),
+            Value::Integer(METADATA_ELEMENT_ID),
+            Value::Blob(record.as_blob().clone()),
+        ]
+    }
+
+    fn load_metadata_if_needed(&mut self, cursors: &mut DbspStateCursors) -> Result<IOResult<()>> {
+        if self.metadata_initialized {
+            return Ok(IOResult::Done(()));
+        }
+
+        let index_key = self.metadata_index_key();
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+        let seek_result = return_if_io!(cursors.index_cursor.seek(
+            SeekKey::IndexKey(&index_record),
+            SeekOp::GE { eq_only: true }
+        ));
+
+        if matches!(seek_result, SeekResult::Found) {
+            let rowid = return_if_io!(cursors.index_cursor.rowid()).ok_or_else(|| {
+                LimboError::InternalError("Index cursor does not have a valid rowid".to_string())
+            })?;
+
+            return_if_io!(cursors
+                .table_cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+
+            let table_record = return_if_io!(cursors.table_cursor.record()).ok_or_else(|| {
+                LimboError::InternalError(
+                    "Found metadata row but could not read record".to_string(),
+                )
+            })?;
+
+            let values = table_record.get_values();
+            let blob_value = values.get(3).ok_or_else(|| {
+                LimboError::InternalError("Invalid metadata record structure".to_string())
+            })?;
+            let blob = if let Value::Blob(b) = blob_value.to_owned() {
+                b
+            } else {
+                return Err(LimboError::InternalError(
+                    "Expected blob value for metadata record".to_string(),
+                ));
+            };
+
+            let record = ImmutableRecord::from_bin_record(blob);
+            let ref_values = record.get_values();
+            let meta_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+            if let Some(Value::Integer(next)) = meta_values.first() {
+                self.next_rowid = *next;
+            }
+            self.metadata_exists = true;
+        } else {
+            self.next_rowid = 1;
+            self.metadata_exists = false;
+        }
+
+        self.metadata_initialized = true;
+        Ok(IOResult::Done(()))
+    }
+
+    fn persist_metadata(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        write_row: &mut WriteRow,
+    ) -> Result<IOResult<()>> {
+        let index_key = self.metadata_index_key();
+        let record_values = self.metadata_record_values();
+        let weight = if self.metadata_exists { 0 } else { 1 };
+        let result = write_row.write_row(cursors, index_key, record_values, weight)?;
+        if matches!(result, IOResult::Done(())) {
+            self.metadata_exists = true;
+            self.metadata_dirty = false;
+            self.metadata_initialized = true;
+        }
+        Ok(result)
     }
 }
 
@@ -1198,10 +1358,7 @@ impl IncrementalOperator for AggregateOperator {
                     delta,
                     min_max_persist_state,
                 } => {
-                    if !self.has_min_max() {
-                        let delta = std::mem::take(delta);
-                        self.commit_state = AggregateCommitState::Done { delta };
-                    } else {
+                    if self.has_min_max() {
                         return_and_restore_if_io!(
                             &mut self.commit_state,
                             state,
@@ -1212,10 +1369,27 @@ impl IncrementalOperator for AggregateOperator {
                                 |group_key_str| self.generate_group_hash(group_key_str)
                             )
                         );
+                    }
 
-                        let delta = std::mem::take(delta);
+                    let delta = std::mem::take(delta);
+                    if self.metadata_dirty {
+                        self.commit_state = AggregateCommitState::PersistMetadata {
+                            delta,
+                            write_row: WriteRow::new(),
+                        };
+                    } else {
                         self.commit_state = AggregateCommitState::Done { delta };
                     }
+                }
+                AggregateCommitState::PersistMetadata { delta, write_row } => {
+                    return_and_restore_if_io!(
+                        &mut self.commit_state,
+                        state,
+                        self.persist_metadata(cursors, write_row)
+                    );
+
+                    let delta = std::mem::take(delta);
+                    self.commit_state = AggregateCommitState::Done { delta };
                 }
                 AggregateCommitState::Done { delta } => {
                     self.commit_state = AggregateCommitState::Idle;
