@@ -1,8 +1,11 @@
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
+use crate::state_machine::TransitionResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::types::IOResult;
 use parking_lot::RwLock;
+use std::fs;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -1506,4 +1509,58 @@ fn transaction_display() {
     let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: 11 }, RowID { table_id: MVTableId(-2), row_id: 13 }], read_set: [RowID { table_id: MVTableId(-2), row_id: 17 }, RowID { table_id: MVTableId(-2), row_id: 19 }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
+}
+
+#[test]
+fn test_restart_recovers_from_wal_when_mvcc_enabled() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let wal_path = format!("{}-wal", db.path.as_ref().unwrap());
+
+    {
+        let conn = db.connect();
+        let mv_store = db.get_mvcc_store();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        conn.execute("INSERT INTO test (x) VALUES (1)").unwrap();
+
+        let pager = conn.pager.read().clone();
+        let mut ckpt_sm =
+            CheckpointStateMachine::new(pager.clone(), mv_store.clone(), conn.clone());
+        loop {
+            match ckpt_sm.step_for_test().unwrap() {
+                TransitionResult::Io(io) => {
+                    io.wait(conn.db.io.as_ref()).unwrap();
+                }
+                TransitionResult::Continue => {
+                    if matches!(ckpt_sm.state_for_test(), CheckpointState::CheckpointWal) {
+                        break;
+                    }
+                }
+                TransitionResult::Done(_) => {
+                    panic!("checkpoint completed unexpectedly");
+                }
+            }
+        }
+        ckpt_sm.checkpoint_lock_for_test().unlock();
+        drop(ckpt_sm);
+        // Intentionally drop connection without calling close() to simulate a crash
+    }
+
+    let wal_metadata = fs::metadata(&wal_path).unwrap();
+    assert!(
+        wal_metadata.len() > 0,
+        "expected WAL file to contain frames"
+    );
+
+    db.restart();
+
+    {
+        let conn = db.connect();
+        let rows = get_rows(&conn, "SELECT * FROM test");
+        assert_eq!(rows.len(), 1);
+        match rows[0][0] {
+            Value::Integer(count) => assert_eq!(count, 1),
+            _ => panic!("expected integer count"),
+        }
+        conn.close().unwrap();
+    }
 }

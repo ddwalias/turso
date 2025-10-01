@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum CheckpointState {
     AcquireLock,
     BeginPagerTxn,
@@ -623,6 +623,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 ))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_for_test(&mut self) -> Result<TransitionResult<CheckpointResult>> {
+        self.step_inner(&())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> CheckpointState {
+        self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_lock_for_test(&self) -> &Arc<TursoRwLock> {
+        &self.checkpoint_lock
     }
 }
 

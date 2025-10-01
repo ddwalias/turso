@@ -522,6 +522,10 @@ impl Database {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
+        if self.mv_store.is_some() {
+            self.maybe_recover_logical_log(pager.clone())?;
+            self.maybe_recover_crashed_checkpoint(pager.clone())?;
+        }
 
         let page_size = pager.get_page_size_unchecked();
 
@@ -571,6 +575,36 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    pub fn maybe_recover_logical_log(self: &Arc<Database>, pager: Arc<Pager>) -> Result<()> {
+        let Some(mv_store) = self.mv_store.clone() else {
+            panic!("tryign to recover logical log without mvcc");
+        };
+        if !mv_store.needs_recover() {
+            return Ok(());
+        }
+
+        mv_store.recover_logical_log(&self.io, &pager)
+    }
+
+    pub fn maybe_recover_crashed_checkpoint(&self, pager: Arc<Pager>) -> Result<()> {
+        let should_recover = {
+            let shared_wal = self.shared_wal.read();
+            shared_wal.enabled.load(Ordering::Acquire) & shared_wal.loaded.load(Ordering::Acquire)
+                && shared_wal.max_frame.load(Ordering::Acquire) > 0
+        };
+
+        if !should_recover {
+            return Ok(());
+        }
+
+        tracing::info!("Recover from MVCC checkpoint from existing WAL frame");
+        pager.wal_checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+
+        Ok(())
     }
 
     pub fn is_readonly(&self) -> bool {
