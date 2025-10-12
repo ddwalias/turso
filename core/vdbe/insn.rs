@@ -132,6 +132,29 @@ impl InsertFlags {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteFlags(pub u8);
+
+impl DeleteFlags {
+    pub const NCHANGE: u8 = 0x01; //Increment the row counter
+    pub fn new() -> Self {
+        DeleteFlags(0)
+    }
+
+    pub fn has(&self, flag: u8) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    pub fn nchange(mut self, change: bool) -> Self {
+        if change {
+            self.0 |= DeleteFlags::NCHANGE;
+        } else {
+            self.0 &= !DeleteFlags::NCHANGE;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum RegisterOrLiteral<T: Copy + std::fmt::Display> {
     Register(usize),
@@ -791,6 +814,7 @@ pub enum Insn {
     Delete {
         cursor_id: CursorID,
         table_name: String,
+        flag: DeleteFlags,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry

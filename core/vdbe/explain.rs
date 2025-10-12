@@ -1141,10 +1141,10 @@ pub fn insn_to_row(
                 flag.0 as u16,
                 format!("intkey=r[{key_reg}] data=r[{record_reg}]"),
             ),
-            Insn::Delete { cursor_id, table_name } => (
+            Insn::Delete { cursor_id, flag, table_name } => (
                 "Delete",
                 *cursor_id as i32,
-                0,
+                flag.0 as i32,
                 0,
                 Value::build_text(table_name),
                 0,

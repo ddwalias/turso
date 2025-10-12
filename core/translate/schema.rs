@@ -20,6 +20,7 @@ use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
+use crate::vdbe::insn::DeleteFlags;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
 use crate::Connection;
 use crate::{bail_parse_error, Result};
@@ -744,6 +745,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
         table_name: SQLITE_TABLEID.to_string(),
+        flag: DeleteFlags::new(),
     });
 
     program.resolve_label(next_label, program.offset());
@@ -944,6 +946,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,
             table_name: SQLITE_TABLEID.to_string(),
+            flag: DeleteFlags::new(),
         });
         program.emit_insn(Insn::Insert {
             cursor: sqlite_schema_cursor_id_1,
@@ -1004,6 +1007,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
             table_name: "sqlite_sequence".to_string(),
+            flag: DeleteFlags::new(),
         });
 
         program.resolve_label(continue_loop_label, program.offset());

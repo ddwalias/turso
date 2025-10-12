@@ -42,7 +42,7 @@ use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{CmpInsFlags, DeleteFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
@@ -841,6 +841,7 @@ fn emit_delete_insns(
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
+            flag: DeleteFlags::new(),
         });
 
         if let Some(index) = iteration_index {
@@ -849,6 +850,7 @@ fn emit_delete_insns(
             program.emit_insn(Insn::Delete {
                 cursor_id: iteration_index_cursor,
                 table_name: index.name.clone(),
+                flag: DeleteFlags::new(),
             });
         }
     }
@@ -1617,6 +1619,7 @@ fn emit_update_insns(
             program.emit_insn(Insn::Delete {
                 cursor_id,
                 table_name: table_name.to_string(),
+                flag: DeleteFlags::new(),
             });
         }
 

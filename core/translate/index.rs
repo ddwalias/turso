@@ -12,7 +12,7 @@ use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
 use crate::vdbe::builder::CursorKey;
-use crate::vdbe::insn::{CmpInsFlags, Cookie};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, DeleteFlags};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType},
@@ -595,6 +595,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
+        flag: DeleteFlags::new(),
     });
 
     program.resolve_label(next_label, program.offset());

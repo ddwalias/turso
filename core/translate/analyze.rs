@@ -13,7 +13,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{DeleteFlags, Insn, RegisterOrLiteral},
     },
     Result,
 };
@@ -97,6 +97,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::Delete {
             cursor_id,
             table_name: "sqlite_stat1".to_string(),
+            flag: DeleteFlags::new(),
         });
         program.emit_insn(Insn::Next {
             cursor_id,

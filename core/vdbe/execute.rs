@@ -18,7 +18,7 @@ use crate::types::{
     SeekResult, Text,
 };
 use crate::util::normalize_ident;
-use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::insn::{DeleteFlags, InsertFlags};
 use crate::vdbe::{registers_to_ref_values, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
@@ -6046,7 +6046,8 @@ pub fn op_delete(
     load_insn!(
         Delete {
             cursor_id,
-            table_name
+            table_name,
+            flag
         },
         insn
     );
@@ -6131,10 +6132,13 @@ pub fn op_delete(
     }
 
     state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
-    program
-        .n_change
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    state.pc += 1;
+    if flag.has(DeleteFlags::NCHANGE) {
+        program
+            .n_change
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.pc += 1;
+    }
+
     Ok(InsnFunctionStepResult::Step)
 }
 

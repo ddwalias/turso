@@ -10,7 +10,7 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_pk_change_checks};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::planner::ROWID_STRS;
-use crate::vdbe::insn::CmpInsFlags;
+use crate::vdbe::insn::{CmpInsFlags, DeleteFlags};
 use crate::Connection;
 use crate::{
     bail_parse_error,
@@ -725,6 +725,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Delete {
             cursor_id: tbl_cursor_id,
             table_name: table.get_name().to_string(),
+            flag: DeleteFlags::new(),
         });
         program.emit_insn(Insn::Insert {
             cursor: tbl_cursor_id,

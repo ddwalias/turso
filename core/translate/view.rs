@@ -4,7 +4,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, DeleteFlags, Insn, RegisterOrLiteral};
 use crate::{Connection, Result};
 use std::sync::Arc;
 use turso_parser::ast;
@@ -113,6 +113,7 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
         table_name: normalized_view_name.clone(),
+        flag: DeleteFlags::new(),
     });
     program.emit_insn(Insn::Next {
         cursor_id: view_cursor_id,
@@ -409,6 +410,7 @@ pub fn translate_drop_view(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
+        flag: DeleteFlags::new(),
     });
 
     program.resolve_label(skip_delete_label, program.offset());
