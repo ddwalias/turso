@@ -22,6 +22,12 @@ do_execsql_test_on_specific_db {:memory:} changes-shows-most-recent {
     select changes();
 } {4}
 
+do_execsql_test_on_specific_db {:memory:} changes-counts_rowid_updates_once {
+    create table temp (t1 integer primary key;
+    insert into temp values (1);
+    update temp set t1 = t1 + 10;
+    select changes();
+} {1}
 
 # github.com/tursodatabase/turso/issues/3259
 do_execsql_test_on_specific_db {:memory:} changes-doesnt-track-indexes {
