@@ -745,7 +745,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
         table_name: SQLITE_TABLEID.to_string(),
-        flag: DeleteFlags::new(),
+        flag: DeleteFlags::new().nchange(true),
     });
 
     program.resolve_label(next_label, program.offset());
@@ -946,7 +946,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,
             table_name: SQLITE_TABLEID.to_string(),
-            flag: DeleteFlags::new(),
+            flag: DeleteFlags::new().nchange(true),
         });
         program.emit_insn(Insn::Insert {
             cursor: sqlite_schema_cursor_id_1,
@@ -1007,7 +1007,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
             table_name: "sqlite_sequence".to_string(),
-            flag: DeleteFlags::new(),
+            flag: DeleteFlags::new().nchange(true),
         });
 
         program.resolve_label(continue_loop_label, program.offset());

@@ -725,7 +725,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Delete {
             cursor_id: tbl_cursor_id,
             table_name: table.get_name().to_string(),
-            flag: DeleteFlags::new(),
+            flag: DeleteFlags::new().nchange(true),
         });
         program.emit_insn(Insn::Insert {
             cursor: tbl_cursor_id,
