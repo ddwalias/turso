@@ -2,7 +2,7 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::CursorTrait;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -1112,7 +1112,7 @@ impl IncrementalView {
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
         pager: &std::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut BTreeCursor,
+        _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
         assert!(
@@ -1565,10 +1565,22 @@ mod tests {
             unique_sets: vec![],
         };
 
-        schema.add_btree_table(Arc::new(customers_table));
-        schema.add_btree_table(Arc::new(orders_table));
-        schema.add_btree_table(Arc::new(products_table));
-        schema.add_btree_table(Arc::new(logs_table));
+        schema
+            .add_btree_table(Arc::new(customers_table))
+            .expect("Test setup: failed to add customers table");
+
+        schema
+            .add_btree_table(Arc::new(orders_table))
+            .expect("Test setup: failed to add orders table");
+
+        schema
+            .add_btree_table(Arc::new(products_table))
+            .expect("Test setup: failed to add products table");
+
+        schema
+            .add_btree_table(Arc::new(logs_table))
+            .expect("Test setup: failed to add logs table");
+
         schema
     }
 

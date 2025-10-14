@@ -9,7 +9,10 @@ use rand::{
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
-        query::{Create, CreateIndex, Delete, Insert, Select, update::Update},
+        query::{
+            Create, CreateIndex, Delete, DropIndex, Insert, Select, alter_table::AlterTable,
+            update::Update,
+        },
         table::Table,
     },
 };
@@ -71,12 +74,33 @@ fn random_create_index<R: rand::Rng + ?Sized>(
         .expect("table should exist")
         .indexes
         .iter()
-        .any(|i| i == &create_index.index_name)
+        .any(|i| i.index_name == create_index.index_name)
     {
         create_index = CreateIndex::arbitrary(rng, conn_ctx);
     }
 
     Query::CreateIndex(create_index)
+}
+
+fn random_alter_table<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    assert!(!conn_ctx.tables().is_empty());
+    Query::AlterTable(AlterTable::arbitrary(rng, conn_ctx))
+}
+
+fn random_drop_index<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    assert!(
+        conn_ctx
+            .tables()
+            .iter()
+            .any(|table| !table.indexes.is_empty())
+    );
+    Query::DropIndex(DropIndex::arbitrary(rng, conn_ctx))
 }
 
 /// Possible queries that can be generated given the table state
@@ -93,7 +117,7 @@ pub const fn possible_queries(tables: &[Table]) -> &'static [QueryDiscriminants]
 type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;
 
 impl QueryDiscriminants {
-    pub fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
+    fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -106,6 +130,8 @@ impl QueryDiscriminants {
             QueryDiscriminants::Update => random_update,
             QueryDiscriminants::Drop => random_drop,
             QueryDiscriminants::CreateIndex => random_create_index,
+            QueryDiscriminants::AlterTable => random_alter_table,
+            QueryDiscriminants::DropIndex => random_drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
@@ -117,7 +143,7 @@ impl QueryDiscriminants {
         }
     }
 
-    pub fn weight(&self, remaining: &Remaining) -> u32 {
+    fn weight(&self, remaining: &Remaining) -> u32 {
         match self {
             QueryDiscriminants::Create => remaining.create,
             // remaining.select / 3 is for the random_expr generation
@@ -128,6 +154,8 @@ impl QueryDiscriminants {
             QueryDiscriminants::Update => remaining.update,
             QueryDiscriminants::Drop => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
+            QueryDiscriminants::AlterTable => remaining.alter_table,
+            QueryDiscriminants::DropIndex => remaining.drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {

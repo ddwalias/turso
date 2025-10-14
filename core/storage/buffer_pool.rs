@@ -427,11 +427,8 @@ impl Arena {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 mod arena {
-    #[cfg(target_vendor = "apple")]
-    use libc::MAP_ANON as MAP_ANONYMOUS;
-    #[cfg(target_os = "linux")]
     use libc::MAP_ANONYMOUS;
     use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
     use std::ffi::c_void;
@@ -463,11 +460,11 @@ mod arena {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), miri))]
 mod arena {
     pub fn alloc(len: usize) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
-        unsafe { std::alloc::alloc(layout) }
+        unsafe { std::alloc::alloc_zeroed(layout) }
     }
     pub fn dealloc(ptr: *mut u8, len: usize) {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();

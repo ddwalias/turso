@@ -2,6 +2,7 @@ package tech.turso.jdbc4;
 
 import java.io.InputStream;
 import java.io.Reader;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.net.URL;
@@ -27,10 +28,16 @@ import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
+/** JDBC 4 ResultSet implementation for Turso databases. */
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;
 
+  /**
+   * Creates a new JDBC4ResultSet.
+   *
+   * @param resultSet the underlying Turso result set
+   */
   public JDBC4ResultSet(TursoResultSet resultSet) {
     this.resultSet = resultSet;
   }
@@ -368,19 +375,33 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int findColumn(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    if (columnLabel == null || columnLabel.isEmpty()) {
+      throw new SQLException("column name not found");
+    }
+
+    final String[] columnNames = resultSet.getColumnNames();
+    for (int i = 0; i < columnNames.length; i++) {
+      if (columnNames[i].equals(columnLabel)) {
+        return i + 1;
+      }
+    }
+    throw new SQLException("column name " + columnLabel + " not found");
   }
 
   @Override
   @SkipNullableCheck
   public Reader getCharacterStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(() -> new StringReader((String) result));
   }
 
   @Override
-  @SkipNullableCheck
+  @Nullable
   public Reader getCharacterStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getCharacterStream(findColumn(columnLabel));
   }
 
   @Override
@@ -397,17 +418,21 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public BigDecimal getBigDecimal(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBigDecimal(findColumn(columnLabel));
   }
 
   @Override
   public boolean isBeforeFirst() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    // Empty ResultSet should return false per JDBC spec
+    if (resultSet.isEmpty()) {
+      return false;
+    }
+    return resultSet.isOpen() && resultSet.getRow() == 0 && !resultSet.isPastLastRow();
   }
 
   @Override
   public boolean isAfterLast() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return resultSet.isOpen() && resultSet.isPastLastRow();
   }
 
   @Override
@@ -442,7 +467,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int getRow() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return resultSet.getRow();
   }
 
   @Override
@@ -801,43 +826,73 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @Nullable
   public Date getDate(int columnIndex, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getDate(columnIndex);
+    final Date date = getDate(columnIndex);
+    if (date == null || cal == null) {
+      return date;
+    }
+
+    final Calendar localCal = Calendar.getInstance();
+    localCal.setTime(date);
+
+    final long offset =
+        cal.getTimeZone().getOffset(date.getTime())
+            - localCal.getTimeZone().getOffset(date.getTime());
+
+    return new Date(date.getTime() + offset);
   }
 
   @Override
   @Nullable
   public Date getDate(String columnLabel, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getDate(columnLabel);
+    return getDate(findColumn(columnLabel), cal);
   }
 
   @Override
-  @SkipNullableCheck
+  @Nullable
   public Time getTime(int columnIndex, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getTime(columnIndex);
+    final Time time = getTime(columnIndex);
+    if (time == null || cal == null) {
+      return time;
+    }
+
+    final Calendar localCal = Calendar.getInstance();
+    localCal.setTime(time);
+
+    final long offset =
+        cal.getTimeZone().getOffset(time.getTime())
+            - localCal.getTimeZone().getOffset(time.getTime());
+
+    return new Time(time.getTime() + offset);
   }
 
   @Override
   @SkipNullableCheck
   public Time getTime(String columnLabel, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getTime(columnLabel);
+    return getTime(findColumn(columnLabel), cal);
   }
 
   @Override
   @SkipNullableCheck
   public Timestamp getTimestamp(int columnIndex, Calendar cal) throws SQLException {
-    // TODO: Apply calendar timezone conversion
-    return getTimestamp(columnIndex);
+    final Timestamp timestamp = getTimestamp(columnIndex);
+    if (timestamp == null || cal == null) {
+      return timestamp;
+    }
+
+    final Calendar localCal = Calendar.getInstance();
+    localCal.setTime(timestamp);
+
+    final long offset =
+        cal.getTimeZone().getOffset(timestamp.getTime())
+            - localCal.getTimeZone().getOffset(timestamp.getTime());
+
+    return new Timestamp(timestamp.getTime() + offset);
   }
 
   @Override
   @SkipNullableCheck
   public Timestamp getTimestamp(String columnLabel, Calendar cal) throws SQLException {
-    // TODO: Apply calendar timezone conversion
-    return getTimestamp(findColumn(columnLabel));
+    return getTimestamp(findColumn(columnLabel), cal);
   }
 
   @Override
@@ -1279,8 +1334,19 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     throw new UnsupportedOperationException("not implemented");
   }
 
+  /**
+   * Functional interface for result set value suppliers.
+   *
+   * @param <T> the type of value to supply
+   */
   @FunctionalInterface
   public interface ResultSetSupplier<T> {
+    /**
+     * Gets a result from the result set.
+     *
+     * @return the result value
+     * @throws Exception if an error occurs
+     */
     T get() throws Exception;
   }
 

@@ -53,9 +53,9 @@ use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionM
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
-#[cfg(all(feature = "fs", target_family = "unix"))]
+#[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
-#[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
+#[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
@@ -489,7 +489,7 @@ impl Database {
                 conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
                 conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
@@ -791,7 +791,7 @@ impl Database {
             None => match vfs.as_ref() {
                 "memory" => Arc::new(MemoryIO::new()),
                 "syscall" => Arc::new(SyscallIO::new()?),
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
+                #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),
                 other => {
                     return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
@@ -1513,7 +1513,7 @@ impl Connection {
             let pager = conn.pager.read();
             if db.db_state.is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
         }
         Ok((io, conn))
@@ -1740,11 +1740,6 @@ impl Connection {
         self.pager.read().cacheflush()
     }
 
-    pub fn clear_page_cache(&self) -> Result<()> {
-        self.pager.read().clear_page_cache();
-        Ok(())
-    }
-
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1888,7 +1883,7 @@ impl Connection {
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
-        self.pager.write().clear_page_cache();
+        self.pager.write().clear_page_cache(false);
         let pager = self.db.init_pager(Some(size.get() as usize))?;
         pager.enable_encryption(self.db.opts.enable_encryption);
         *self.pager.write() = Arc::new(pager);

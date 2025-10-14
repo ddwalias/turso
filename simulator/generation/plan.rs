@@ -58,14 +58,17 @@ impl InteractionPlan {
     pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
         let len = plan
             .iter()
-            .filter(|interaction| !interaction.is_transaction())
+            .filter(|interaction| !interaction.ignore())
             .count();
         Self { plan, mvcc, len }
     }
 
     #[inline]
-    pub fn plan(&self) -> &[Interactions] {
-        &self.plan
+    fn new_len(&self) -> usize {
+        self.plan
+            .iter()
+            .filter(|interaction| !interaction.ignore())
+            .count()
     }
 
     /// Length of interactions that are not transaction statements
@@ -75,10 +78,57 @@ impl InteractionPlan {
     }
 
     pub fn push(&mut self, interactions: Interactions) {
-        if !interactions.is_transaction() {
+        if !interactions.ignore() {
             self.len += 1;
         }
         self.plan.push(interactions);
+    }
+
+    pub fn remove(&mut self, index: usize) -> Interactions {
+        let interactions = self.plan.remove(index);
+        if !interactions.ignore() {
+            self.len -= 1;
+        }
+        interactions
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.plan.truncate(len);
+        self.len = self.new_len();
+    }
+
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Interactions) -> bool,
+    {
+        let f = |t: &mut Interactions| {
+            let ignore = t.ignore();
+            let retain = f(t);
+            // removed an interaction that was not previously ignored
+            if !retain && !ignore {
+                self.len -= 1;
+            }
+            retain
+        };
+        self.plan.retain_mut(f);
+    }
+
+    #[expect(dead_code)]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&Interactions) -> bool,
+    {
+        let f = |t: &Interactions| {
+            let ignore = t.ignore();
+            let retain = f(t);
+            // removed an interaction that was not previously ignored
+            if !retain && !ignore {
+                self.len -= 1;
+            }
+            retain
+        };
+        self.plan.retain(f);
+        self.len = self.new_len();
     }
 
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
@@ -170,18 +220,7 @@ impl InteractionPlan {
     }
 
     pub(crate) fn stats(&self) -> InteractionStats {
-        let mut stats = InteractionStats {
-            select_count: 0,
-            insert_count: 0,
-            delete_count: 0,
-            update_count: 0,
-            create_count: 0,
-            create_index_count: 0,
-            drop_count: 0,
-            begin_count: 0,
-            commit_count: 0,
-            rollback_count: 0,
-        };
+        let mut stats = InteractionStats::default();
 
         fn query_stat(q: &Query, stats: &mut InteractionStats) {
             match q {
@@ -195,12 +234,19 @@ impl InteractionPlan {
                 Query::Begin(_) => stats.begin_count += 1,
                 Query::Commit(_) => stats.commit_count += 1,
                 Query::Rollback(_) => stats.rollback_count += 1,
+                Query::AlterTable(_) => stats.alter_table_count += 1,
+                Query::DropIndex(_) => stats.drop_index_count += 1,
                 Query::Placeholder => {}
             }
         }
         for interactions in &self.plan {
             match &interactions.interactions {
                 InteractionsType::Property(property) => {
+                    if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
+                        // Skip Property::AllTableHaveExpectedContent when counting stats
+                        // this allows us to generate more relevant interactions as we count less Select's to the Stats
+                        continue;
+                    }
                     for interaction in &property.interactions(interactions.connection_index) {
                         if let InteractionType::Query(query) = &interaction.interaction {
                             query_stat(query, &mut stats);
@@ -427,11 +473,14 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                 if let InteractionType::Query(Query::Placeholder) = &interaction.interaction {
                     let stats = self.plan.stats();
 
+                    let conn_ctx = env.connection_context(interaction.connection_index);
+
                     let remaining_ = remaining(
                         env.opts.max_interactions,
                         &env.profile.query,
                         &stats,
                         env.profile.experimental_mvcc,
+                        &conn_ctx,
                     );
 
                     let InteractionsType::Property(property) =
@@ -439,8 +488,6 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                     else {
                         unreachable!("only properties have extensional queries");
                     };
-
-                    let conn_ctx = env.connection_context(interaction.connection_index);
 
                     let queries = possible_queries(conn_ctx.tables());
                     let query_distr = QueryDistribution::new(queries, &remaining_);
@@ -591,6 +638,17 @@ impl Interactions {
             InteractionsType::Query(..) | InteractionsType::Fault(..) => false,
         }
     }
+
+    /// Interactions that are not counted/ignored in the InteractionPlan.
+    /// Used in InteractionPlan to not count certain interactions to its length, as they are just auxiliary. This allows more
+    /// meaningful interactions to be generation
+    fn ignore(&self) -> bool {
+        self.is_transaction()
+            || matches!(
+                self.interactions,
+                InteractionsType::Property(Property::AllTableHaveExpectedContent { .. })
+            )
+    }
 }
 
 impl Deref for Interactions {
@@ -624,14 +682,6 @@ impl InteractionsType {
 }
 
 impl Interactions {
-    pub(crate) fn name(&self) -> Option<&str> {
-        match &self.interactions {
-            InteractionsType::Property(property) => Some(property.name()),
-            InteractionsType::Query(_) => None,
-            InteractionsType::Fault(_) => None,
-        }
-    }
-
     pub(crate) fn interactions(&self) -> Vec<Interaction> {
         match &self.interactions {
             InteractionsType::Property(property) => property.interactions(self.connection_index),
@@ -707,36 +757,27 @@ impl Display for InteractionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InteractionStats {
-    pub(crate) select_count: u32,
-    pub(crate) insert_count: u32,
-    pub(crate) delete_count: u32,
-    pub(crate) update_count: u32,
-    pub(crate) create_count: u32,
-    pub(crate) create_index_count: u32,
-    pub(crate) drop_count: u32,
-    pub(crate) begin_count: u32,
-    pub(crate) commit_count: u32,
-    pub(crate) rollback_count: u32,
-}
-
-impl InteractionStats {
-    pub fn total_writes(&self) -> u32 {
-        self.insert_count
-            + self.delete_count
-            + self.update_count
-            + self.create_count
-            + self.create_index_count
-            + self.drop_count
-    }
+    pub select_count: u32,
+    pub insert_count: u32,
+    pub delete_count: u32,
+    pub update_count: u32,
+    pub create_count: u32,
+    pub create_index_count: u32,
+    pub drop_count: u32,
+    pub begin_count: u32,
+    pub commit_count: u32,
+    pub rollback_count: u32,
+    pub alter_table_count: u32,
+    pub drop_index_count: u32,
 }
 
 impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Write: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -747,15 +788,13 @@ impl Display for InteractionStats {
             self.begin_count,
             self.commit_count,
             self.rollback_count,
+            self.alter_table_count,
+            self.drop_index_count,
         )
     }
 }
 
 type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
-
-enum AssertionAST {
-    Pick(),
-}
 
 #[derive(Clone)]
 pub struct Assertion {
@@ -1237,12 +1276,13 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
             &env.profile.query,
             &stats,
             env.profile.experimental_mvcc,
+            conn_ctx,
         );
 
         let queries = possible_queries(conn_ctx.tables());
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![
             (
                 query_distr.weights().total_weight(),

@@ -23,7 +23,7 @@ use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         emitter::prepare_cdc_if_necessary,
-        plan::{DistinctCtx, Distinctness, Scan},
+        plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
         result_row::emit_select_result,
     },
     types::SeekOp,
@@ -388,6 +388,7 @@ pub fn init_loop(
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+            jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -606,7 +607,10 @@ pub fn open_loop(
                             );
                         };
 
-                        let start_reg = program.alloc_registers(seek_def.key.len());
+                        let max_registers = seek_def
+                            .size(&seek_def.start)
+                            .max(seek_def.size(&seek_def.end));
+                        let start_reg = program.alloc_registers(max_registers);
                         emit_seek(
                             program,
                             table_references,
@@ -710,6 +714,7 @@ fn emit_conditions(
             jump_if_condition_is_true: false,
             jump_target_when_true,
             jump_target_when_false: next,
+            jump_target_when_null: next,
         };
         translate_condition_expr(
             program,
@@ -724,7 +729,7 @@ fn emit_conditions(
     Ok(())
 }
 
-/// SQLite (and so Limbo) processes joins as a nested loop.
+/// SQLite (and so Turso) processes joins as a nested loop.
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)
@@ -1146,7 +1151,8 @@ fn emit_seek(
     seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
     let is_index = seek_index.is_some();
-    let Some(seek) = seek_def.seek.as_ref() else {
+    if seek_def.prefix.is_empty() && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+    {
         // If there is no seek key, we start from the first or last row of the index,
         // depending on the iteration direction.
         //
@@ -1196,43 +1202,34 @@ fn emit_seek(
     };
     // We allocated registers for the full index key, but our seek key might not use the full index key.
     // See [crate::translate::optimizer::build_seek_def] for more details about in which cases we do and don't use the full index key.
-    for i in 0..seek_def.key.len() {
+    for (i, key) in seek_def.iter(&seek_def.start).enumerate() {
         let reg = start_reg + i;
-        if i >= seek.len {
-            if seek.null_pad {
-                program.emit_insn(Insn::Null {
-                    dest: reg,
-                    dest_end: None,
-                });
-            }
-        } else {
-            let expr = &seek_def.key[i].0;
-            translate_expr_no_constant_opt(
-                program,
-                Some(tables),
-                expr,
-                reg,
-                &t_ctx.resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            // If the seek key column is not verifiably non-NULL, we need check whether it is NULL,
-            // and if so, jump to the loop end.
-            // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,
-            // which would erroneously return all rows from t, as NULL is lower than any non-NULL value in index key comparisons.
-            if !expr.is_nonnull(tables) {
-                program.emit_insn(Insn::IsNull {
+        match key {
+            SeekKeyComponent::Expr(expr) => {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(tables),
+                    expr,
                     reg,
-                    target_pc: loop_end,
-                });
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                // If the seek key column is not verifiably non-NULL, we need check whether it is NULL,
+                // and if so, jump to the loop end.
+                // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,
+                // which would erroneously return all rows from t, as NULL is lower than any non-NULL value in index key comparisons.
+                if !expr.is_nonnull(tables) {
+                    program.emit_insn(Insn::IsNull {
+                        reg,
+                        target_pc: loop_end,
+                    });
+                }
             }
+            SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
         }
     }
-    let num_regs = if seek.null_pad {
-        seek_def.key.len()
-    } else {
-        seek.len
-    };
-    match seek.op {
+    let num_regs = seek_def.size(&seek_def.start);
+    match seek_def.start.op {
         SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
             cursor_id: seek_cursor_id,
@@ -1289,7 +1286,7 @@ fn emit_seek_termination(
     seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
     let is_index = seek_index.is_some();
-    let Some(termination) = seek_def.termination.as_ref() else {
+    if seek_def.prefix.is_empty() && matches!(seek_def.end.last_component, SeekKeyComponent::None) {
         program.preassign_label_to_next_insn(loop_start);
         // If we will encounter NULLs in the index at the end of iteration (Forward + Desc OR Backward + Asc)
         // then, we must explicitly stop before them as seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
@@ -1320,46 +1317,23 @@ fn emit_seek_termination(
         return Ok(());
     };
 
-    // How many non-NULL values were used for seeking.
-    let seek_len = seek_def.seek.as_ref().map_or(0, |seek| seek.len);
+    // For all index key values apart from the last one, we are guaranteed to use the same values
+    // as these values were emited from common prefix, so we don't need to emit them again.
 
-    // How many values will be used for the termination condition.
-    let num_regs = if termination.null_pad {
-        seek_def.key.len()
-    } else {
-        termination.len
-    };
-    for i in 0..seek_def.key.len() {
-        let reg = start_reg + i;
-        let is_last = i == seek_def.key.len() - 1;
-
-        // For all index key values apart from the last one, we are guaranteed to use the same values
-        // as were used for the seek, so we don't need to emit them again.
-        if i < seek_len && !is_last {
-            continue;
-        }
-        // For the last index key value, we need to emit a NULL if the termination condition is NULL-padded.
-        // See [SeekKey::null_pad] and [crate::translate::optimizer::build_seek_def] for why this is the case.
-        if i >= termination.len && !termination.null_pad {
-            continue;
-        }
-        if is_last && termination.null_pad {
-            program.emit_insn(Insn::Null {
-                dest: reg,
-                dest_end: None,
-            });
-        // if the seek key is shorter than the termination key, we need to translate the remaining suffix of the termination key.
-        // if not, we just reuse what was emitted for the seek.
-        } else if seek_len < termination.len {
+    let num_regs = seek_def.size(&seek_def.end);
+    let last_reg = start_reg + seek_def.prefix.len();
+    match &seek_def.end.last_component {
+        SeekKeyComponent::Expr(expr) => {
             translate_expr_no_constant_opt(
                 program,
                 Some(tables),
-                &seek_def.key[i].0,
-                reg,
+                expr,
+                last_reg,
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
         }
+        SeekKeyComponent::None => {}
     }
     program.preassign_label_to_next_insn(loop_start);
     let mut rowid_reg = None;
@@ -1385,7 +1359,7 @@ fn emit_seek_termination(
             Some(Affinity::Numeric)
         };
     }
-    match (is_index, termination.op) {
+    match (is_index, seek_def.end.op) {
         (true, SeekOp::GE { .. }) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,
             start_reg,
