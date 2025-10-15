@@ -815,43 +815,44 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         row_versions.value().for_each_node(|node| {
                             if let Some(row_version) = &node.version {
-                                let mut updated_bound = None;
-
                                 let _ = row_version.bound.fetch_update(|mut bound| {
                                     if let Some(TxTimestampOrID::TxID(id)) = bound.begin {
                                         if id == self.tx_id {
                                             // New version is valid STARTING FROM committing transaction's end timestamp
                                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                             bound.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                            updated_bound = Some(bound);
+                                            mvcc_store.insert_version_raw(
+                                                &mut log_record.row_versions,
+                                                row_version.clone(),
+                                            ); // FIXME: optimize cloning out
+
+                                            if row_version.row.id.table_id
+                                                == SQLITE_SCHEMA_MVCC_TABLE_ID
+                                            {
+                                                self.did_commit_schema_change = true;
+                                            }
                                         }
-                                    } else if let Some(TxTimestampOrID::TxID(id)) = bound.end {
+                                    }
+                                    if let Some(TxTimestampOrID::TxID(id)) = bound.end {
                                         if id == self.tx_id {
                                             // Old version is valid UNTIL committing transaction's end timestamp
                                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                             bound.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                            mvcc_store.insert_version_raw(
+                                                &mut log_record.row_versions,
+                                                row_version.clone(),
+                                            ); // FIXME: optimize cloning out
+
+                                            if row_version.row.id.table_id
+                                                == SQLITE_SCHEMA_MVCC_TABLE_ID
+                                            {
+                                                self.did_commit_schema_change = true;
+                                            }
                                         }
                                     }
 
                                     Some(bound)
                                 });
-
-                                //Side effect
-                                if let Some(new_bound) = updated_bound {
-                                    let logged_version = RowVersion {
-                                        bound: AtomicCell::new(new_bound),
-                                        row: row_version.row.clone(),
-                                    };
-
-                                    mvcc_store.insert_version_raw(
-                                        &mut log_record.row_versions,
-                                        logged_version,
-                                    ); // FIXME: optimize cloning out
-
-                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                        self.did_commit_schema_change = true;
-                                    }
-                                }
                             }
                             None::<()>
                         });
@@ -1861,7 +1862,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                     // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                     bound.begin = None;
                                     bound.end = None;
-                                    return Some(bound);
                                 }
                             }
 
