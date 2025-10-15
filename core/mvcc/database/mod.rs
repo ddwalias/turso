@@ -1799,7 +1799,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 row_versions.value().for_each_node(|node| {
                     if let Some(row_version) = &node.version {
                         let _ = row_version.bound.fetch_update(|mut bound| {
-                            // The core logic is now in a clean, testable helper function.
                             if let Some(TxTimestampOrID::TxID(id)) = bound.begin {
                                 turso_assert!(
                                     id == tx_id,
@@ -2040,7 +2039,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let versions = self.rows.get_or_insert_with(id, RowVersionChain::new);
         versions
             .value()
-            .insert_sorted(row_version, |ts| self.get_begin_timestamp(&ts));
+            .insert_sorted(row_version, |ts| self.get_begin_timestamp(ts));
     }
 
     /// Inserts a new row version into the internal data structure for versions,
