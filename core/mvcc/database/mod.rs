@@ -815,22 +815,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         row_versions.value().for_each_node(|node| {
                             if let Some(row_version) = &node.version {
-                                let _ = row_version.bound.fetch_update(|mut bound| {
+                                let update_result = row_version.bound.fetch_update(|mut bound| {
+                                    let mut needs_update = false;
                                     if let Some(TxTimestampOrID::TxID(id)) = bound.begin {
                                         if id == self.tx_id {
                                             // New version is valid STARTING FROM committing transaction's end timestamp
                                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                             bound.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                            mvcc_store.insert_version_raw(
-                                                &mut log_record.row_versions,
-                                                row_version.clone(),
-                                            ); // FIXME: optimize cloning out
-
-                                            if row_version.row.id.table_id
-                                                == SQLITE_SCHEMA_MVCC_TABLE_ID
-                                            {
-                                                self.did_commit_schema_change = true;
-                                            }
+                                            needs_update = true;
                                         }
                                     }
                                     if let Some(TxTimestampOrID::TxID(id)) = bound.end {
@@ -838,21 +830,26 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                             // Old version is valid UNTIL committing transaction's end timestamp
                                             // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                             bound.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                            mvcc_store.insert_version_raw(
-                                                &mut log_record.row_versions,
-                                                row_version.clone(),
-                                            ); // FIXME: optimize cloning out
-
-                                            if row_version.row.id.table_id
-                                                == SQLITE_SCHEMA_MVCC_TABLE_ID
-                                            {
-                                                self.did_commit_schema_change = true;
-                                            }
+                                            needs_update = true;
                                         }
                                     }
 
-                                    Some(bound)
+                                    if needs_update {
+                                        return Some(bound);
+                                    }
+                                    None
                                 });
+
+                                if update_result.is_ok() {
+                                    mvcc_store.insert_version_raw(
+                                        &mut log_record.row_versions,
+                                        row_version.clone(),
+                                    ); // FIXME: optimize cloning out
+
+                                    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                        self.did_commit_schema_change = true;
+                                    }
+                                }
                             }
                             None::<()>
                         });
