@@ -179,12 +179,14 @@ impl RowVersion {
     }
 }
 
+/// Intrusive list node used by `RowVersionChain`.
 struct RowVersionNode {
     version: Option<RowVersion>,
     next: AtomicShared<RowVersionNode>,
 }
 
 impl RowVersionNode {
+    /// Returns a node that owns the provided `RowVersion`.
     fn new(version: RowVersion) -> Self {
         Self {
             version: Some(version),
@@ -192,6 +194,7 @@ impl RowVersionNode {
         }
     }
 
+    /// Creates the sentinel node that marks the beginning of every chain.
     fn sentinel() -> Self {
         Self {
             version: None,
@@ -199,6 +202,7 @@ impl RowVersionNode {
         }
     }
 
+    /// Returns the row version stored by this node, if present.
     fn row_version(&self) -> Option<&RowVersion> {
         self.version.as_ref()
     }
@@ -213,21 +217,25 @@ impl LinkedList for RowVersionNode {
     }
 }
 
+/// Lock-free collection of row versions that backs MVCC lookups for a single row.
 pub struct RowVersionChain {
     head: Shared<RowVersionNode>,
 }
 
 impl RowVersionChain {
+    /// Creates an empty chain whose head is a sentinel node.
     pub fn new() -> Self {
         Self {
             head: Shared::new(RowVersionNode::sentinel()),
         }
     }
 
+    /// Returns the sentinel node protected by the supplied guard.
     fn head_ref<'g>(&self, guard: &'g Guard) -> &'g RowVersionNode {
         self.head.get_guarded_ref(guard)
     }
 
+    /// Returns `true` if the chain does not contain any row versions.
     fn is_empty(&self) -> bool {
         let guard = Guard::new();
         self.head_ref(&guard)
@@ -236,6 +244,7 @@ impl RowVersionChain {
             .is_none()
     }
 
+    /// Retains only the row versions accepted by `predicate`, returning how many entries were dropped.
     fn retain<F>(&self, mut predicate: F) -> usize
     where
         F: FnMut(&RowVersion) -> bool,
@@ -266,6 +275,7 @@ impl RowVersionChain {
         dropped
     }
 
+    /// Iterates over the chain, returning the first non-`None` value produced by `f`.
     fn for_each_node<F, R>(&self, mut f: F) -> Option<R>
     where
         F: FnMut(&RowVersionNode) -> Option<R>,
@@ -285,9 +295,14 @@ impl RowVersionChain {
         None
     }
 
-    // This function is kinda unreliable when insert the version that has the same beginning,
-    // However this function is just to be compatible with how we currently handle inserting
-    // to row version chain and will be removed in the future, so whatever :)
+    /// Inserts `row_version` while keeping nodes sorted by the timestamp derived from
+    /// `get_begin_ts`.
+    ///
+    /// # Note
+    ///
+    /// When multiple versions share the same begin timestamp this ordering is only best-effort.
+    /// The method exists to emulate legacy behaviour and should be replaced once callers can
+    /// operate on unsorted chains.
     fn insert_sorted<F>(&self, row_version: RowVersion, mut get_begin_ts: F)
     where
         F: FnMut(&Option<TxTimestampOrID>) -> u64,
@@ -326,6 +341,7 @@ impl RowVersionChain {
         }
     }
 
+    /// Appends a new row version directly after the sentinel without reordering existing entries.
     pub fn insert(&self, row_version: RowVersion) {
         let mut new_entry = Shared::new(RowVersionNode::new(row_version));
         let guard = Guard::new();
