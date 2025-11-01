@@ -2344,6 +2344,15 @@ impl Pager {
                             page_id as u32,
                         );
 
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if matches!(self.get_auto_vacuum_mode(), AutoVacuumMode::Full) {
+                            return_if_io!(self.ptrmap_put(
+                                page_id as u32,
+                                PtrmapType::FreePage,
+                                trunk_page_id,
+                            ));
+                        }
+
                         break;
                     }
                     *state = FreePageState::NewTrunk { page: page.clone() };
@@ -2363,6 +2372,18 @@ impl Pager {
                     contents.write_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
+
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if matches!(self.get_auto_vacuum_mode(), AutoVacuumMode::Full) {
+                        return_if_io!(self.ptrmap_put(page_id as u32, PtrmapType::FreePage, 1,));
+                        if trunk_page_id != 0 {
+                            return_if_io!(self.ptrmap_put(
+                                trunk_page_id,
+                                PtrmapType::FreePage,
+                                page_id as u32,
+                            ));
+                        }
+                    }
                     break;
                 }
             }

@@ -24,6 +24,22 @@ use crate::runner::memory::io::MemorySimIO;
 
 use super::cli::SimulatorCLI;
 
+fn initialize_autovacuum_database(path: &Path, page_size: usize) {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            panic!("failed to create database directory {parent:?}: {err}");
+        }
+    }
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "page_size", &(page_size as i64))
+        .unwrap();
+    connection
+        .pragma_update(None, "auto_vacuum", &(1i64))
+        .unwrap();
+    connection.execute_batch("VACUUM;").unwrap();
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum SimulationType {
     Default,
@@ -235,6 +251,8 @@ impl SimulatorEnv {
         }
         self.db = None;
 
+        initialize_autovacuum_database(&db_path, self.opts.page_size);
+
         let db = match Database::open_file(
             io.clone(),
             db_path.to_str().unwrap(),
@@ -329,6 +347,8 @@ impl SimulatorEnv {
         if wal_path.exists() {
             std::fs::remove_file(&wal_path).unwrap();
         }
+
+        initialize_autovacuum_database(&db_path, opts.page_size);
 
         let mut profile = profile.clone();
         // Conditionals here so that we can override some profile options from the CLI
