@@ -124,6 +124,11 @@ impl HeaderRefMut {
         }
     }
 
+    pub fn borrow(&self) -> &DatabaseHeader {
+        let content: &PageContent = self.0.get_contents();
+        bytemuck::from_bytes::<DatabaseHeader>(&content.buffer.as_slice()[0..DatabaseHeader::SIZE])
+    }
+
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
         bytemuck::from_bytes_mut::<DatabaseHeader>(
@@ -2266,20 +2271,22 @@ impl Pager {
         const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
-        let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
         tracing::debug!(?state);
         loop {
             match &mut *state {
                 FreePageState::Start => {
-                    if page_id < 2 || page_id > header.database_size.get() as usize {
-                        return Err(LimboError::Corrupt(format!(
-                            "Invalid page number {page_id} for free operation"
-                        )));
+                    {
+                        let header = header_ref.borrow();
+                        if page_id < 2 || page_id > header.database_size.get() as usize {
+                            return Err(LimboError::Corrupt(format!(
+                                "Invalid page number {page_id} for free operation"
+                            )));
+                        }
                     }
 
-                    let (page, _c) = match page.take() {
+                    let (page_ref, completion) = match page.take() {
                         Some(page) => {
                             assert_eq!(
                                 page.get().id,
@@ -2296,21 +2303,37 @@ impl Pager {
                         }
                         None => {
                             let (page, c) = self.read_page(page_id as i64)?;
-                            (page, Some(c))
+                            (page, c)
                         }
                     };
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                    if let Some(c) = completion {
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
+                    }
 
-                    let trunk_page_id = header.freelist_trunk_page.get();
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if !matches!(self.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                        return_if_io!(self.ptrmap_put(page_id as u32, PtrmapType::FreePage, 0));
+                    }
+
+                    let trunk_page_id = {
+                        let header = header_ref.borrow_mut();
+                        header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                        header.freelist_trunk_page.get()
+                    };
 
                     if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk { page };
+                        *state = FreePageState::AddToTrunk { page: page_ref };
                     } else {
-                        *state = FreePageState::NewTrunk { page };
+                        *state = FreePageState::NewTrunk { page: page_ref };
                     }
                 }
                 FreePageState::AddToTrunk { page } => {
-                    let trunk_page_id = header.freelist_trunk_page.get();
+                    let trunk_page_id = {
+                        let header = header_ref.borrow();
+                        header.freelist_trunk_page.get()
+                    };
                     let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
                     if let Some(c) = c {
                         if !c.succeeded() {
@@ -2324,8 +2347,10 @@ impl Pager {
                         trunk_page_contents.read_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET);
 
                     // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
-                    let max_free_list_entries =
-                        (header.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                    let max_free_list_entries = {
+                        let header = header_ref.borrow();
+                        (header.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS
+                    };
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(
@@ -2353,8 +2378,10 @@ impl Pager {
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
                     self.add_dirty(page)?;
-
-                    let trunk_page_id = header.freelist_trunk_page.get();
+                    let trunk_page_id = {
+                        let header = header_ref.borrow();
+                        header.freelist_trunk_page.get()
+                    };
 
                     let contents = page.get().contents.as_mut().unwrap();
                     // Point to previous trunk
@@ -2362,7 +2389,10 @@ impl Pager {
                     // Zero leaf count
                     contents.write_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
                     // Update page 1 to point to new trunk
-                    header.freelist_trunk_page = (page_id as u32).into();
+                    {
+                        let header = header_ref.borrow_mut();
+                        header.freelist_trunk_page = (page_id as u32).into();
+                    }
                     break;
                 }
             }

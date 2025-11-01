@@ -28,6 +28,12 @@ use crate::{
     Completion, Page,
 };
 
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::{
+    ptrmap::{is_ptrmap_page, PtrmapType, FIRST_PTRMAP_PAGE_NO},
+    AutoVacuumMode,
+};
+
 use crate::{
     return_corrupt, return_if_io,
     types::{compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
@@ -2592,21 +2598,26 @@ impl BTreeCursor {
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
         let _ = self.move_to_right_state.1.take();
 
+        let usable_space = self.usable_space();
+        let old_rightmost_leaf = self.stack.top_ref();
+        let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
+        if old_rightmost_leaf_contents.overflow_cells.len() != 1 {
+            tracing::debug!(
+                "balance_quick(fallback, overflow_cells={})",
+                old_rightmost_leaf_contents.overflow_cells.len()
+            );
+            let BalanceState { sub_state, .. } = &mut self.balance_state;
+            *sub_state = BalanceSubState::NonRootPickSiblings;
+            self.stack.pop();
+            return Ok(IOResult::Done(()));
+        }
+
         // Allocate a new leaf page and insert the overflow cell payload in it.
         let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
             PageType::TableLeaf,
             0,
             BtreePageAllocMode::Any
         ));
-
-        let usable_space = self.usable_space();
-        let old_rightmost_leaf = self.stack.top_ref();
-        let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
-        turso_assert!(
-            old_rightmost_leaf_contents.overflow_cells.len() == 1,
-            "expected 1 overflow cell, got {}",
-            old_rightmost_leaf_contents.overflow_cells.len()
-        );
 
         let parent = self
             .stack
@@ -2656,6 +2667,8 @@ impl BTreeCursor {
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
         self.pager.add_dirty(parent)?;
         self.pager.add_dirty(&new_rightmost_leaf)?;
+
+        return_if_io!(Self::update_ptrmap_for_page(&self.pager, &parent));
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -3830,6 +3843,12 @@ impl BTreeCursor {
                         assert!(sibling_count_new < balance_info.sibling_count);
                     }
 
+                    for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                        let page = page.as_ref().unwrap();
+                        return_if_io!(Self::update_ptrmap_for_page(&self.pager, page));
+                    }
+                    return_if_io!(Self::update_ptrmap_for_page(&self.pager, &parent_page));
+
                     #[cfg(debug_assertions)]
                     BTreeCursor::post_balance_non_root_validation(
                         parent_page,
@@ -4402,11 +4421,62 @@ impl BTreeCursor {
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
+        return_if_io!(Self::update_ptrmap_for_page(&self.pager, &root));
+        return_if_io!(Self::update_ptrmap_for_page(&self.pager, &child));
         self.root_page = root.get().id as i64;
         self.stack.clear();
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
         self.stack.push(child.clone());
+        Ok(IOResult::Done(()))
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn update_ptrmap_for_page(pager: &Pager, page: &PageRef) -> Result<IOResult<()>> {
+        if matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return Ok(IOResult::Done(()));
+        }
+
+        let parent_page_id = page.get().id as u32;
+        let contents = page.get_contents();
+        match contents.page_type() {
+            PageType::IndexInterior | PageType::TableInterior => {
+                if let Some(right_child) = contents.rightmost_pointer() {
+                    return_if_io!(pager.ptrmap_put(
+                        right_child,
+                        PtrmapType::BTreeNode,
+                        parent_page_id,
+                    ));
+                }
+
+                for idx in 0..contents.cell_count() {
+                    let child_page = contents.cell_interior_read_left_child_page(idx);
+                    return_if_io!(pager.ptrmap_put(
+                        child_page,
+                        PtrmapType::BTreeNode,
+                        parent_page_id,
+                    ));
+                }
+
+                for overflow_cell in &contents.overflow_cells {
+                    if overflow_cell.payload.len() >= 4 {
+                        let child_page = read_u32(&overflow_cell.payload, 0);
+                        return_if_io!(pager.ptrmap_put(
+                            child_page,
+                            PtrmapType::BTreeNode,
+                            parent_page_id,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(IOResult::Done(()))
+    }
+
+    #[cfg(feature = "omit_autovacuum")]
+    fn update_ptrmap_for_page(_pager: &Pager, _page: &PageRef) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
@@ -5765,6 +5835,17 @@ pub enum IntegrityCheckError {
         got: usize,
         expected: usize,
     },
+    #[cfg(not(feature = "omit_autovacuum"))]
+    #[error(
+        "Pointer map mismatch for page {page_id}: expected {expected_type:?} with parent {expected_parent}, found {actual_type:?} with parent {actual_parent:?}"
+    )]
+    PtrMapMismatch {
+        page_id: i64,
+        expected_type: PtrmapType,
+        expected_parent: u32,
+        actual_type: Option<PtrmapType>,
+        actual_parent: Option<u32>,
+    },
     #[error("Page {page_id} referenced multiple times (references={references:?}, page_category={page_category:?})")]
     PageReferencedMultipleTimes {
         page_id: i64,
@@ -5808,8 +5889,10 @@ struct IntegrityCheckPageEntry {
 pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
     pub db_size: usize,
-    first_leaf_level: Option<usize>,
     pub page_reference: FxHashMap<i64, i64>,
+    #[cfg(not(feature = "omit_autovacuum"))]
+    page_categories: FxHashMap<i64, PageCategory>,
+    first_leaf_level: Option<usize>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -5820,6 +5903,8 @@ impl IntegrityCheckState {
             page_stack: Vec::new(),
             db_size,
             page_reference: FxHashMap::default(),
+            #[cfg(not(feature = "omit_autovacuum"))]
+            page_categories: FxHashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {
@@ -5838,7 +5923,8 @@ impl IntegrityCheckState {
         page_idx: i64,
         page_category: PageCategory,
         errors: &mut Vec<IntegrityCheckError>,
-    ) {
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
         assert!(
             self.page_stack.is_empty(),
             "stack should be empty before integrity check for new root"
@@ -5846,7 +5932,7 @@ impl IntegrityCheckState {
         self.first_leaf_level = None;
         let _ = self.page.take();
         // root can't be referenced from anywhere - so we insert "zero entry" for it
-        self.push_page(
+        return_if_io!(self.push_page_checked(
             IntegrityCheckPageEntry {
                 page_idx,
                 level: 0,
@@ -5855,7 +5941,9 @@ impl IntegrityCheckState {
             },
             0,
             errors,
-        );
+            pager,
+        ));
+        Ok(IOResult::Done(()))
     }
 
     fn push_page(
@@ -5865,6 +5953,12 @@ impl IntegrityCheckState {
         errors: &mut Vec<IntegrityCheckError>,
     ) {
         let page_id = entry.page_idx;
+        #[cfg(not(feature = "omit_autovacuum"))]
+        {
+            self.page_categories
+                .entry(page_id)
+                .or_insert(entry.page_category);
+        }
         let Some(previous) = self.page_reference.insert(page_id, referenced_by) else {
             self.page_stack.push(entry);
             return;
@@ -5874,6 +5968,114 @@ impl IntegrityCheckState {
             page_category: entry.page_category,
             references: vec![previous, referenced_by],
         });
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn push_page_checked(
+        &mut self,
+        entry: IntegrityCheckPageEntry,
+        referenced_by: i64,
+        errors: &mut Vec<IntegrityCheckError>,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        return_if_io!(self.validate_ptrmap_entry(&entry, referenced_by, pager, errors));
+        self.push_page(entry, referenced_by, errors);
+        Ok(IOResult::Done(()))
+    }
+
+    #[cfg(feature = "omit_autovacuum")]
+    fn push_page_checked(
+        &mut self,
+        entry: IntegrityCheckPageEntry,
+        referenced_by: i64,
+        errors: &mut Vec<IntegrityCheckError>,
+        _pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        self.push_page(entry, referenced_by, errors);
+        Ok(IOResult::Done(()))
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn validate_ptrmap_entry(
+        &mut self,
+        entry: &IntegrityCheckPageEntry,
+        referenced_by: i64,
+        pager: &Arc<Pager>,
+        errors: &mut Vec<IntegrityCheckError>,
+    ) -> Result<IOResult<()>> {
+        if matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return Ok(IOResult::Done(()));
+        }
+
+        let Ok(page_no_u32) = u32::try_from(entry.page_idx) else {
+            return Ok(IOResult::Done(()));
+        };
+
+        let page_size = pager.get_page_size_unchecked().get() as usize;
+        if page_no_u32 < FIRST_PTRMAP_PAGE_NO || is_ptrmap_page(page_no_u32, page_size) {
+            return Ok(IOResult::Done(()));
+        }
+
+        let expected = match entry.page_category {
+            PageCategory::Normal => {
+                if referenced_by == 0 {
+                    Some((PtrmapType::RootPage, 0))
+                } else if referenced_by > 0 {
+                    let parent = match u32::try_from(referenced_by) {
+                        Ok(v) => v,
+                        Err(_) => return Ok(IOResult::Done(())),
+                    };
+                    Some((PtrmapType::BTreeNode, parent))
+                } else {
+                    None
+                }
+            }
+            PageCategory::Overflow => {
+                let parent = match u32::try_from(referenced_by) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(IOResult::Done(())),
+                };
+                let parent_category = self.page_categories.get(&referenced_by);
+                if let Some(parent_category) = parent_category {
+                    match parent_category {
+                        PageCategory::Normal => Some((PtrmapType::Overflow1, parent)),
+                        PageCategory::Overflow => Some((PtrmapType::Overflow2, parent)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            PageCategory::FreeListTrunk | PageCategory::FreePage => Some((PtrmapType::FreePage, 0)),
+            PageCategory::PointerMap => None,
+        };
+
+        let Some((expected_type, expected_parent)) = expected else {
+            return Ok(IOResult::Done(()));
+        };
+
+        let actual_entry = return_if_io!(pager.ptrmap_get(page_no_u32));
+        match actual_entry {
+            Some(actual)
+                if actual.entry_type == expected_type
+                    && actual.parent_page_no == expected_parent => {}
+            Some(actual) => errors.push(IntegrityCheckError::PtrMapMismatch {
+                page_id: entry.page_idx,
+                expected_type,
+                expected_parent,
+                actual_type: Some(actual.entry_type),
+                actual_parent: Some(actual.parent_page_no),
+            }),
+            None => errors.push(IntegrityCheckError::PtrMapMismatch {
+                page_id: entry.page_idx,
+                expected_type,
+                expected_parent,
+                actual_type: None,
+                actual_parent: None,
+            }),
+        }
+
+        Ok(IOResult::Done(()))
     }
 }
 impl std::fmt::Debug for IntegrityCheckState {
@@ -5928,7 +6130,7 @@ pub fn integrity_check(
             state.freelist_count.actual_count += 1;
             let next_freelist_trunk_page = contents.read_u32_no_offset(0);
             if next_freelist_trunk_page != 0 {
-                state.push_page(
+                return_if_io!(state.push_page_checked(
                     IntegrityCheckPageEntry {
                         page_idx: next_freelist_trunk_page as i64,
                         level,
@@ -5937,12 +6139,13 @@ pub fn integrity_check(
                     },
                     page.get().id as i64,
                     errors,
-                );
+                    pager
+                ));
             }
             let page_pointers = contents.read_u32_no_offset(4);
             for i in 0..page_pointers {
                 let page_pointer = contents.read_u32_no_offset((8 + 4 * i) as usize);
-                state.push_page(
+                return_if_io!(state.push_page_checked(
                     IntegrityCheckPageEntry {
                         page_idx: page_pointer as i64,
                         level,
@@ -5951,7 +6154,8 @@ pub fn integrity_check(
                     },
                     page.get().id as i64,
                     errors,
-                );
+                    pager
+                ));
             }
             continue;
         }
@@ -5962,7 +6166,7 @@ pub fn integrity_check(
         if page_category == PageCategory::Overflow {
             let next_overflow_page = contents.read_u32_no_offset(0);
             if next_overflow_page != 0 {
-                state.push_page(
+                return_if_io!(state.push_page_checked(
                     IntegrityCheckPageEntry {
                         page_idx: next_overflow_page as i64,
                         level,
@@ -5971,7 +6175,8 @@ pub fn integrity_check(
                     },
                     page.get().id as i64,
                     errors,
-                );
+                    pager
+                ));
             }
             continue;
         }
@@ -6016,7 +6221,7 @@ pub fn integrity_check(
             let cell = contents.cell_get(cell_idx, usable_space)?;
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
-                    state.push_page(
+                    return_if_io!(state.push_page_checked(
                         IntegrityCheckPageEntry {
                             page_idx: table_interior_cell.left_child_page as i64,
                             level: level + 1,
@@ -6025,7 +6230,8 @@ pub fn integrity_check(
                         },
                         page.get().id as i64,
                         errors,
-                    );
+                        pager
+                    ));
                     let rowid = table_interior_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
@@ -6065,7 +6271,7 @@ pub fn integrity_check(
                     }
                     next_rowid = rowid;
                     if let Some(first_overflow_page) = table_leaf_cell.first_overflow_page {
-                        state.push_page(
+                        return_if_io!(state.push_page_checked(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
@@ -6074,11 +6280,12 @@ pub fn integrity_check(
                             },
                             page.get().id as i64,
                             errors,
-                        );
+                            pager
+                        ));
                     }
                 }
                 BTreeCell::IndexInteriorCell(index_interior_cell) => {
-                    state.push_page(
+                    return_if_io!(state.push_page_checked(
                         IntegrityCheckPageEntry {
                             page_idx: index_interior_cell.left_child_page as i64,
                             level: level + 1,
@@ -6087,9 +6294,10 @@ pub fn integrity_check(
                         },
                         page.get().id as i64,
                         errors,
-                    );
+                        pager
+                    ));
                     if let Some(first_overflow_page) = index_interior_cell.first_overflow_page {
-                        state.push_page(
+                        return_if_io!(state.push_page_checked(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
@@ -6098,7 +6306,8 @@ pub fn integrity_check(
                             },
                             page.get().id as i64,
                             errors,
-                        );
+                            pager
+                        ));
                     }
                 }
                 BTreeCell::IndexLeafCell(index_leaf_cell) => {
@@ -6115,7 +6324,7 @@ pub fn integrity_check(
                         state.first_leaf_level = Some(level);
                     }
                     if let Some(first_overflow_page) = index_leaf_cell.first_overflow_page {
-                        state.push_page(
+                        return_if_io!(state.push_page_checked(
                             IntegrityCheckPageEntry {
                                 page_idx: first_overflow_page as i64,
                                 level,
@@ -6124,14 +6333,15 @@ pub fn integrity_check(
                             },
                             page.get().id as i64,
                             errors,
-                        );
+                            pager
+                        ));
                     }
                 }
             }
         }
 
         if let Some(rightmost) = contents.rightmost_pointer() {
-            state.push_page(
+            return_if_io!(state.push_page_checked(
                 IntegrityCheckPageEntry {
                     page_idx: rightmost as i64,
                     level: level + 1,
@@ -6140,7 +6350,8 @@ pub fn integrity_check(
                 },
                 page.get().id as i64,
                 errors,
-            );
+                pager
+            ));
         }
 
         // Now we add free blocks to the coverage checker
@@ -7679,6 +7890,24 @@ fn fill_cell_payload(
                             "new overflow page is not loaded"
                         );
                         let new_overflow_page_id = new_overflow_page.get().id as u32;
+
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if !matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                            let parent_page_no = current_overflow_page
+                                .as_ref()
+                                .map(|page| page.get().id as u32)
+                                .unwrap_or_else(|| page.get().id as u32);
+                            let ptrmap_type = if current_overflow_page.is_some() {
+                                PtrmapType::Overflow2
+                            } else {
+                                PtrmapType::Overflow1
+                            };
+                            return_if_io!(pager.ptrmap_put(
+                                new_overflow_page_id,
+                                ptrmap_type,
+                                parent_page_no,
+                            ));
+                        }
 
                         if let Some(prev_page) = current_overflow_page {
                             // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.

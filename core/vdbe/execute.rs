@@ -8294,13 +8294,19 @@ pub fn op_integrity_check(
                         .freelist_pages
                         .get()));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
-                integrity_check_state.start(
+                return_if_io!(integrity_check_state.start(
                     freelist_trunk_page as i64,
                     PageCategory::FreeListTrunk,
                     &mut errors,
-                );
+                    pager,
+                ));
             } else {
-                integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors);
+                return_if_io!(integrity_check_state.start(
+                    roots[0],
+                    PageCategory::Normal,
+                    &mut errors,
+                    pager
+                ));
                 current_root_idx += 1;
             }
             state.op_integrity_check_state = OpIntegrityCheckState::Checking {
@@ -8316,7 +8322,12 @@ pub fn op_integrity_check(
         } => {
             return_if_io!(integrity_check(integrity_check_state, errors, pager));
             if *current_root_idx < roots.len() {
-                integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
+                return_if_io!(integrity_check_state.start(
+                    roots[*current_root_idx],
+                    PageCategory::Normal,
+                    errors,
+                    pager
+                ));
                 *current_root_idx += 1;
                 return Ok(InsnFunctionStepResult::Step);
             } else {
@@ -8346,11 +8357,12 @@ pub fn op_integrity_check(
                             ) {
                                 tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
 
-                                integrity_check_state.start(
+                                return_if_io!(integrity_check_state.start(
                                     page_number as i64,
                                     PageCategory::PointerMap,
                                     errors,
-                                );
+                                    pager
+                                ));
                             }
                         }
                     }
