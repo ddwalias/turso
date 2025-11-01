@@ -40,6 +40,9 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::{ptrmap::PtrmapType, AutoVacuumMode};
 use std::{
     any::Any,
     cell::{Cell, Ref, RefCell},
@@ -2592,21 +2595,26 @@ impl BTreeCursor {
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
         let _ = self.move_to_right_state.1.take();
 
+        let usable_space = self.usable_space();
+        let old_rightmost_leaf = self.stack.top_ref();
+        let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
+        if old_rightmost_leaf_contents.overflow_cells.len() != 1 {
+            tracing::debug!(
+                "balance_quick(fallback, overflow_cells={})",
+                old_rightmost_leaf_contents.overflow_cells.len()
+            );
+            let BalanceState { sub_state, .. } = &mut self.balance_state;
+            *sub_state = BalanceSubState::NonRootPickSiblings;
+            self.stack.pop();
+            return Ok(IOResult::Done(()));
+        }
+
         // Allocate a new leaf page and insert the overflow cell payload in it.
         let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
             PageType::TableLeaf,
             0,
             BtreePageAllocMode::Any
         ));
-
-        let usable_space = self.usable_space();
-        let old_rightmost_leaf = self.stack.top_ref();
-        let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
-        turso_assert!(
-            old_rightmost_leaf_contents.overflow_cells.len() == 1,
-            "expected 1 overflow cell, got {}",
-            old_rightmost_leaf_contents.overflow_cells.len()
-        );
 
         let parent = self
             .stack
@@ -2656,6 +2664,15 @@ impl BTreeCursor {
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
         self.pager.add_dirty(parent)?;
         self.pager.add_dirty(&new_rightmost_leaf)?;
+
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if !matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return_if_io!(self.pager.ptrmap_put(
+                new_rightmost_leaf.get().id as u32,
+                PtrmapType::BTreeNode,
+                parent.get().id as u32,
+            ));
+        }
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -3492,14 +3509,27 @@ impl BTreeCursor {
                                 page.get().id = *new_id;
                                 self.pager
                                     .upsert_page_in_cache(*new_id, page.clone(), true)?;
-                            }
                         }
+                    }
 
-                        #[cfg(debug_assertions)]
-                        {
-                            tracing::debug!(
-                                "balance_non_root(parent page_id={})",
-                                parent_page.get().id
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if !matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                        let parent_page_id = parent_page.get().id as u32;
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                            let page = page.as_ref().unwrap();
+                            return_if_io!(self.pager.ptrmap_put(
+                                page.get().id as u32,
+                                PtrmapType::BTreeNode,
+                                parent_page_id,
+                            ));
+                        }
+                    }
+
+                    #[cfg(debug_assertions)]
+                    {
+                        tracing::debug!(
+                            "balance_non_root(parent page_id={})",
+                            parent_page.get().id
                             );
                             for page in pages_to_balance_new.iter().take(sibling_count_new) {
                                 tracing::debug!(
@@ -4402,6 +4432,16 @@ impl BTreeCursor {
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
+
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if !matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return_if_io!(self.pager.ptrmap_put(
+                child.get().id as u32,
+                PtrmapType::BTreeNode,
+                root.get().id as u32,
+            ));
+        }
+
         self.root_page = root.get().id as i64;
         self.stack.clear();
         self.stack.push(root);
