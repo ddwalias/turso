@@ -4,7 +4,7 @@ use criterion::async_executor::FuturesExecutor;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::mvcc::clock::LocalClock;
-use turso_core::mvcc::database::{MvStore, Row, RowID};
+use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
 
@@ -18,7 +18,7 @@ fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
     let conn = db.connect().unwrap();
-    let mvcc_store = db.get_mv_store().unwrap().clone();
+    let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {
         _db: db,
         conn,
@@ -68,7 +68,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     RowID {
                         table_id: (-2).into(),
-                        row_id: 1,
+                        row_id: RowKey::Int(1),
                     },
                 )
                 .unwrap();
@@ -95,14 +95,11 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-2).into(),
-                            row_id: 1,
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-2).into(), RowKey::Int(1)),
+                        record_data.clone(),
+                        1,
+                    ),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
@@ -123,14 +120,11 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row {
-                id: RowID {
-                    table_id: (-2).into(),
-                    row_id: 1,
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
+            Row::new_table_row(
+                RowID::new((-2).into(), RowKey::Int(1)),
+                record_data.clone(),
+                1,
+            ),
         )
         .unwrap();
     group.bench_function("read", |b| {
@@ -140,7 +134,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     RowID {
                         table_id: (-2).into(),
-                        row_id: 1,
+                        row_id: RowKey::Int(1),
                     },
                 )
                 .unwrap();
@@ -152,14 +146,11 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row {
-                id: RowID {
-                    table_id: (-2).into(),
-                    row_id: 1,
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
+            Row::new_table_row(
+                RowID::new((-2).into(), RowKey::Int(1)),
+                record_data.clone(),
+                1,
+            ),
         )
         .unwrap();
     group.bench_function("update", |b| {
@@ -167,14 +158,11 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-2).into(),
-                            row_id: 1,
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-2).into(), RowKey::Int(1)),
+                        record_data.clone(),
+                        1,
+                    ),
                 )
                 .unwrap();
         })

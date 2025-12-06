@@ -6,15 +6,14 @@ use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTyp
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner,
+    SelectInner, SelectTable,
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
-    Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+    Column, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use itertools::Itertools;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
@@ -40,13 +39,6 @@ impl Arbitrary for FromClause {
 
         tables.retain(|t| t.name != table.name);
 
-        let name = table.name.clone();
-
-        let mut table_context = JoinTable {
-            tables: Vec::new(),
-            rows: Vec::new(),
-        };
-
         let joins: Vec<_> = (0..num_joins)
             .filter_map(|_| {
                 if tables.is_empty() {
@@ -56,18 +48,6 @@ impl Arbitrary for FromClause {
                 let joined_table_name = join_table.name.clone();
 
                 tables.retain(|t| t.name != join_table.name);
-                table_context.rows = table_context
-                    .rows
-                    .iter()
-                    .cartesian_product(join_table.rows.iter())
-                    .map(|(t_row, j_row)| {
-                        let mut row = t_row.clone();
-                        row.extend(j_row.clone());
-                        row
-                    })
-                    .collect();
-                // TODO: inneficient. use a Deque to push_front?
-                table_context.tables.insert(0, join_table);
                 for row in &mut table.rows {
                     assert_eq!(
                         row.len(),
@@ -84,7 +64,10 @@ impl Arbitrary for FromClause {
                 })
             })
             .collect();
-        FromClause { table: name, joins }
+        FromClause {
+            table: SelectTable::Table(table.name.clone()),
+            joins,
+        }
     }
 }
 
@@ -98,11 +81,12 @@ impl Arbitrary for SelectInner {
         let order_by = rng
             .random_bool(env.opts().query.select.order_by_prob)
             .then(|| {
+                let dependencies = &from.table.dependencies();
                 let order_by_table_candidates = from
                     .joins
                     .iter()
                     .map(|j| &j.table)
-                    .chain(std::iter::once(&from.table))
+                    .chain(dependencies)
                     .collect::<Vec<_>>();
                 let order_by_col_count =
                     (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
@@ -148,6 +132,7 @@ impl Arbitrary for SelectInner {
 }
 
 impl ArbitrarySized for SelectInner {
+    //FIXME this can generate SELECT statements containing fewer columns than the num_result_columns parameter.
     fn arbitrary_sized<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         env: &C,
@@ -155,11 +140,12 @@ impl ArbitrarySized for SelectInner {
     ) -> Self {
         let mut select_inner = SelectInner::arbitrary(rng, env);
         let select_from = &select_inner.from.as_ref().unwrap();
+        let dependencies = select_from.table.dependencies();
         let table_names = select_from
             .joins
             .iter()
             .map(|j| &j.table)
-            .chain(std::iter::once(&select_from.table));
+            .chain(&dependencies);
 
         let flat_columns_names = table_names
             .flat_map(|t| {
@@ -283,23 +269,74 @@ impl Arbitrary for Insert {
             })
         };
 
-        let _gen_select = |rng: &mut R| {
-            // Find a non-empty table
-            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
-            let row = pick(&select_table.rows, rng);
-            let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
-            // Pick another table to insert into
-            let select = Select::simple(select_table.name.clone(), predicate);
+        // we keep this here for now, because gen_select does not generate subqueries, and they're
+        // important for surfacing bugs.
+        let gen_nested_self_insert = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+
+            const MAX_SELF_INSERT_DEPTH: i32 = 5;
+            let nesting_depth = rng.random_range(1..=MAX_SELF_INSERT_DEPTH);
+
+            let mut select = Select::simple(
+                table.name.clone(),
+                Predicate::arbitrary_from(rng, env, table),
+            );
+
+            for _ in 1..nesting_depth {
+                select = Select {
+                    body: SelectBody {
+                        select: Box::new(SelectInner {
+                            distinctness: Distinctness::All,
+                            columns: vec![ResultColumn::Star],
+                            from: Some(FromClause {
+                                table: SelectTable::Select(select),
+                                joins: Vec::new(),
+                            }),
+                            where_clause: Predicate::true_(),
+                            order_by: None,
+                        }),
+                        compounds: Vec::new(),
+                    },
+                    limit: None,
+                };
+            }
+
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
             })
         };
 
-        // TODO: Add back gen_select when https://github.com/tursodatabase/turso/issues/2129 is fixed.
-        // Backtrack here cannot return None
-        backtrack(vec![(1, Box::new(gen_values))], rng).unwrap()
+        let gen_select = |rng: &mut R| {
+            // Find a non-empty table
+            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
+            let row = pick(&select_table.rows, rng);
+            let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
+            // TODO change for arbitrary_sized and insert from arbitrary tables
+            // Build a SELECT from the same table to ensure schema matches for INSERT INTO ... SELECT
+            let select = Select::simple(select_table.name.clone(), predicate);
+            Some(Insert::Select {
+                table: select_table.name.clone(),
+                select: Box::new(select),
+            })
+        };
+
+        let mut choices = vec![
+            (
+                1,
+                Box::new(gen_values) as Box<dyn Fn(&mut R) -> Option<Insert>>,
+            ),
+            (
+                1,
+                Box::new(gen_nested_self_insert) as Box<dyn Fn(&mut R) -> Option<Insert>>,
+            ),
+        ];
+
+        if env.opts().arbitrary_insert_into_select {
+            choices.push((1, Box::new(gen_select)));
+        }
+
+        backtrack(choices, rng).expect("backtrack should with these arguments not return None")
     }
 }
 

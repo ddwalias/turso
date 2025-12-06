@@ -2,29 +2,71 @@ use std::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::schema::create_table;
-use crate::schema::BTreeTable;
-use crate::schema::Column;
-use crate::schema::Table;
-use crate::schema::Type;
-use crate::schema::RESERVED_TABLE_PREFIXES;
+use crate::schema::{
+    create_table, BTreeTable, ColDef, Column, Table, Type, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
-use crate::translate::emitter::emit_cdc_full_record;
-use crate::translate::emitter::emit_cdc_insns;
-use crate::translate::emitter::prepare_cdc_if_necessary;
-use crate::translate::emitter::OperationMode;
-use crate::translate::emitter::Resolver;
-use crate::translate::ProgramBuilder;
-use crate::translate::ProgramBuilderOpts;
+use crate::translate::emitter::{
+    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+};
+use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::Cookie;
-use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, InsertFlags, Insn};
 use crate::Connection;
-use crate::{bail_parse_error, Result};
+use crate::{bail_constraint_error, bail_parse_error, Result};
 
 use turso_ext::VTabKind;
+
+fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> {
+    if let ast::CreateTableBody::ColumnsAndConstraints {
+        options, columns, ..
+    } = &body
+    {
+        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
+        {
+            bail_parse_error!(
+                "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
+            );
+        }
+        for i in 0..columns.len() {
+            let col_i = &columns[i];
+            for constraint in &col_i.constraints {
+                // don't silently ignore CHECK constraints, throw parse error for now
+                match constraint.constraint {
+                    ast::ColumnConstraint::Check { .. } => {
+                        bail_parse_error!("CHECK constraints are not supported yet");
+                    }
+                    ast::ColumnConstraint::Generated { .. } => {
+                        bail_parse_error!("GENERATED columns are not supported yet");
+                    }
+                    ast::ColumnConstraint::NotNull {
+                        conflict_clause, ..
+                    }
+                    | ast::ColumnConstraint::PrimaryKey {
+                        conflict_clause, ..
+                    } if conflict_clause.is_some() => {
+                        bail_parse_error!(
+                            "ON CONFLICT clauses are not supported yet in column definitions"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for j in &columns[(i + 1)..] {
+                if col_i
+                    .col_name
+                    .as_str()
+                    .eq_ignore_ascii_case(j.col_name.as_str())
+                {
+                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
@@ -39,32 +81,8 @@ pub fn translate_create_table(
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
+    validate(&body, connection)?;
 
-    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
-        for i in 0..columns.len() {
-            let col_i = &columns[i];
-
-            for j in &columns[(i + 1)..] {
-                if col_i
-                    .col_name
-                    .as_str()
-                    .eq_ignore_ascii_case(j.col_name.as_str())
-                {
-                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
-                }
-            }
-        }
-    }
-
-    // Check for STRICT mode without experimental flag
-    if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
-        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
-        {
-            bail_parse_error!(
-                "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
-            );
-        }
-    }
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 30,
@@ -289,6 +307,7 @@ pub enum SchemaEntryType {
     Table,
     Index,
     View,
+    Trigger,
 }
 
 impl SchemaEntryType {
@@ -297,6 +316,7 @@ impl SchemaEntryType {
             SchemaEntryType::Table => "table",
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
+            SchemaEntryType::Trigger => "trigger",
         }
     }
 }
@@ -410,7 +430,7 @@ fn collect_autoindexes(
         };
 
         let needs_index = if us.is_primary_key {
-            !(col.primary_key && col.is_rowid_alias)
+            !(col.primary_key() && col.is_rowid_alias())
         } else {
             // UNIQUE single needs an index
             true
@@ -592,6 +612,7 @@ pub fn translate_drop_table(
     resolver: &Resolver,
     if_exists: bool,
     mut program: ProgramBuilder,
+    connection: &Connection,
 ) -> Result<ProgramBuilder> {
     if tbl_name
         .name
@@ -641,6 +662,15 @@ pub fn translate_drop_table(
             tbl_name.name.as_str()
         );
     }
+
+    // Check if foreign keys are enabled and if this table is referenced by foreign keys
+    if connection.foreign_keys_enabled()
+        && resolver
+            .schema
+            .any_resolved_fks_referencing(table.get_name())
+    {
+        bail_constraint_error!("FOREIGN KEY constraint failed");
+    }
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
     let null_reg = program.alloc_register(); //  r1
@@ -649,7 +679,7 @@ pub fn translate_drop_table(
     let table_reg =
         program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()).to_string()); //  r3
     program.mark_last_insn_constant();
-    let table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
+    let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
@@ -664,7 +694,7 @@ pub fn translate_drop_table(
         db: 0,
     });
 
-    //  1. Remove all entries from the schema table related to the table we are dropping, except for triggers
+    //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
     //  loop to beginning of schema table
     let end_metadata_label = program.allocate_label();
     let metadata_loop = program.allocate_label();
@@ -684,18 +714,6 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Ne {
         lhs: table_name_and_root_page_register,
         rhs: table_reg,
-        target_pc: next_label,
-        flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
-    });
-    program.emit_column_or_rowid(
-        sqlite_schema_cursor_id_0,
-        0,
-        table_name_and_root_page_register,
-    );
-    program.emit_insn(Insn::Eq {
-        lhs: table_name_and_root_page_register,
-        rhs: table_type,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
@@ -745,6 +763,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
         table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
     });
 
     program.resolve_label(next_label, program.offset());
@@ -815,18 +834,14 @@ pub fn translate_drop_table(
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns: vec![Column {
-                name: Some("rowid".to_string()),
-                ty: Type::Integer,
-                ty_str: "INTEGER".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
+            columns: vec![Column::new(
+                Some("rowid".to_string()),
+                "INTEGER".to_string(),
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            )],
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
@@ -945,6 +960,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,
             table_name: SQLITE_TABLEID.to_string(),
+            is_part_of_update: false,
         });
         program.emit_insn(Insn::Insert {
             cursor: sqlite_schema_cursor_id_1,
@@ -1005,6 +1021,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
             table_name: "sqlite_sequence".to_string(),
+            is_part_of_update: false,
         });
 
         program.resolve_label(continue_loop_label, program.offset());

@@ -14,7 +14,11 @@ use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
     database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
-    types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
+    database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::SyncEngineIoStats,
+    types::{
+        Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
+    },
 };
 
 use crate::{
@@ -56,7 +60,7 @@ fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_co
         Either5::A(_) => turso_core::Value::Null,
         Either5::B(value) => turso_core::Value::Integer(value),
         Either5::C(value) => turso_core::Value::Float(value),
-        Either5::D(value) => turso_core::Value::Text(turso_core::types::Text::new(&value)),
+        Either5::D(value) => turso_core::Value::Text(turso_core::types::Text::new(value)),
         Either5::E(value) => turso_core::Value::Blob(value),
     }
 }
@@ -107,6 +111,13 @@ pub enum DatabaseRowTransformResultJs {
     Rewrite { stmt: DatabaseRowStatementJs },
 }
 
+#[napi(discriminant = "type")]
+#[derive(Debug)]
+pub enum JsPartialBootstrapStrategy {
+    Prefix { length: i64 },
+    Query { query: String },
+}
+
 #[napi(object, object_to_js = false)]
 pub struct SyncEngineOpts {
     pub path: String,
@@ -119,6 +130,7 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<String>,
+    pub partial_boostrap_strategy: Option<JsPartialBootstrapStrategy>,
 }
 
 struct SyncEngineOptsFilled {
@@ -131,6 +143,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
+    pub partial_boostrap_strategy: PartialBootstrapStrategy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,12 +183,32 @@ impl SyncEngine {
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(not(feature = "browser"))]
+            #[cfg(all(target_os = "linux", not(feature = "browser")))]
+            {
+                if opts.partial_boostrap_strategy.is_none() {
+                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                        napi::Error::new(
+                            napi::Status::GenericFailure,
+                            format!("Failed to create platform IO: {e}"),
+                        )
+                    })?)
+                } else {
+                    use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+                    Arc::new(SparseLinuxIo::new().map_err(|e| {
+                        napi::Error::new(
+                            napi::Status::GenericFailure,
+                            format!("Failed to create sparse IO: {e}"),
+                        )
+                    })?)
+                }
+            }
+            #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
             {
                 Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
-                        format!("Failed to create IO: {e}"),
+                        format!("Failed to create platform IO: {e}"),
                     )
                 })?)
             }
@@ -224,6 +257,17 @@ impl SyncEngine {
                     ))
                 }
             },
+            partial_boostrap_strategy: match opts.partial_boostrap_strategy {
+                Some(JsPartialBootstrapStrategy::Prefix { length }) => {
+                    PartialBootstrapStrategy::Prefix {
+                        length: length as usize,
+                    }
+                }
+                Some(JsPartialBootstrapStrategy::Query { query }) => {
+                    PartialBootstrapStrategy::Query { query }
+                }
+                None => PartialBootstrapStrategy::None,
+            },
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -251,6 +295,7 @@ impl SyncEngine {
                 .remote_encryption
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
+            partial_bootstrap_strategy: self.opts.partial_boostrap_strategy.clone(),
         };
 
         let io = self.io()?;
@@ -260,8 +305,14 @@ impl SyncEngine {
         let path = self.opts.path.clone();
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
-            let initialized =
-                DatabaseSyncEngine::new(&coro, io.clone(), protocol, &path, opts).await?;
+            let initialized = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                SyncEngineIoStats::new(protocol),
+                &path,
+                opts,
+            )
+            .await?;
             let connection = initialized.connect_rw(&coro).await?;
 
             db.lock().unwrap().set_connected(connection).map_err(|e| {
@@ -301,6 +352,12 @@ impl SyncEngine {
     }
 
     #[napi]
+    pub fn protocol_io_step(&self) -> napi::Result<()> {
+        self.protocol()?.step_io_callbacks();
+        Ok(())
+    }
+
+    #[napi]
     pub fn push(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
             let sync_engine = try_read(guard)?;
@@ -323,6 +380,8 @@ impl SyncEngine {
                 last_pull_unix_time: stats.last_pull_unix_time,
                 last_push_unix_time: stats.last_push_unix_time,
                 revision: stats.revision,
+                network_sent_bytes: stats.network_sent_bytes as i64,
+                network_received_bytes: stats.network_received_bytes as i64,
             }))
         })
     }

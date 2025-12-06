@@ -1,12 +1,15 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
-};
+use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::vdbe::affinity::Affinity;
 use parking_lot::RwLock;
+use turso_macros::AtomicEnum;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, AtomicEnum)]
 pub enum ViewState {
     Ready,
     InProgress,
@@ -19,7 +22,7 @@ pub struct View {
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
-    pub state: Mutex<ViewState>,
+    pub state: AtomicViewState,
 }
 
 impl View {
@@ -29,28 +32,28 @@ impl View {
             sql,
             select_stmt,
             columns,
-            state: Mutex::new(ViewState::Ready),
+            state: AtomicViewState::new(ViewState::Ready),
         }
     }
 
     pub fn process(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+        let state = self.state.get();
+        match state {
             ViewState::InProgress => {
                 bail_parse_error!("view {} is circularly defined", self.name)
             }
             ViewState::Ready => {
-                *state = ViewState::InProgress;
+                self.state.set(ViewState::InProgress);
                 Ok(())
             }
         }
     }
 
     pub fn done(&self) {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+        let state = self.state.get();
+        match state {
             ViewState::InProgress => {
-                *state = ViewState::Ready;
+                self.state.set(ViewState::Ready);
             }
             ViewState::Ready => {}
         }
@@ -64,7 +67,7 @@ impl Clone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.clone(),
-            state: Mutex::new(ViewState::Ready),
+            state: AtomicViewState::new(ViewState::Ready),
         }
     }
 }
@@ -72,22 +75,63 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
+/// Trigger structure
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub sql: String,
+    pub table_name: String,
+    pub time: turso_parser::ast::TriggerTime,
+    pub event: turso_parser::ast::TriggerEvent,
+    pub for_each_row: bool,
+    pub when_clause: Option<turso_parser::ast::Expr>,
+    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub temporary: bool,
+}
+
+impl Trigger {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        sql: String,
+        table_name: String,
+        time: Option<turso_parser::ast::TriggerTime>,
+        event: turso_parser::ast::TriggerEvent,
+        for_each_row: bool,
+        when_clause: Option<turso_parser::ast::Expr>,
+        commands: Vec<turso_parser::ast::TriggerCmd>,
+        temporary: bool,
+    ) -> Self {
+        Self {
+            name,
+            sql,
+            table_name,
+            time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
+            event,
+            for_each_row,
+            when_clause,
+            commands,
+            temporary,
+        }
+    }
+}
+
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
+use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
-use crate::{util::normalize_ident, Result};
 use core::fmt;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
@@ -103,6 +147,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
+
+/// The Position in Table for indexes which are arbitrary expressions (index.expr.is_some())
+pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
 
 /// Internal table prefixes that should be protected from CREATE/DROP
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
@@ -127,6 +174,9 @@ pub struct Schema {
     pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 
     pub views: ViewsMap,
+
+    /// table_name to list of triggers
+    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
@@ -161,6 +211,7 @@ impl Schema {
         let materialized_view_sql = HashMap::new();
         let incremental_views = HashMap::new();
         let views: ViewsMap = HashMap::new();
+        let triggers = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
         let incompatible_views = HashSet::new();
         Self {
@@ -169,6 +220,7 @@ impl Schema {
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes,
             indexes_enabled,
@@ -247,6 +299,12 @@ impl Schema {
             // Remove from tables
             self.tables.remove(&name);
 
+            // Remove DBSP state table and its indexes from in-memory schema
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
+            self.tables.remove(&dbsp_table_name);
+            self.remove_indices_for_table(&dbsp_table_name);
+
             // Remove from materialized view tracking
             self.materialized_view_names.remove(&name);
             self.materialized_view_sql.remove(&name);
@@ -300,6 +358,76 @@ impl Schema {
     pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         let name = normalize_ident(name);
         self.views.get(&name).cloned()
+    }
+
+    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+        self.check_object_name_conflict(&trigger.name)?;
+        let table_name = normalize_ident(table_name);
+
+        // See [Schema::add_index] for why we push to the front of the deque.
+        self.triggers
+            .entry(table_name)
+            .or_default()
+            .push_front(Arc::new(trigger));
+
+        Ok(())
+    }
+
+    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+
+        let mut removed = false;
+        for triggers_list in self.triggers.values_mut() {
+            for i in 0..triggers_list.len() {
+                let trigger = &triggers_list[i];
+                if normalize_ident(&trigger.name) == name {
+                    removed = true;
+                    triggers_list.remove(i);
+                    break;
+                }
+            }
+            if removed {
+                break;
+            }
+        }
+        if !removed {
+            return Err(crate::LimboError::ParseError(format!(
+                "no such trigger: {name}"
+            )));
+        }
+        Ok(())
+    }
+    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.triggers.remove(&table_name);
+    }
+
+    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
+        let table_name = normalize_ident(table_name);
+        let name = normalize_ident(name);
+        self.triggers
+            .get(&table_name)
+            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+    }
+
+    pub fn get_triggers_for_table(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
+        let table_name = normalize_ident(table_name);
+        self.triggers
+            .get(&table_name)
+            .map(|triggers| triggers.iter())
+            .unwrap_or_default()
+    }
+
+    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+        let name = normalize_ident(name);
+        self.triggers
+            .values()
+            .flatten()
+            .find(|t| t.name == name)
+            .cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
@@ -367,6 +495,7 @@ impl Schema {
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
+            .filter(|i| !i.is_backing_btree_index())
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -414,7 +543,7 @@ impl Schema {
             mv_cursor.is_none(),
             "mvcc not yet supported for make_from_btree"
         );
-        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
+        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
@@ -438,36 +567,33 @@ impl Schema {
             let mut record_cursor = cursor.record_cursor.borrow_mut();
             // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
             let ty_value = record_cursor.get_value(&row, 0)?;
-            let ValueRef::Text(ty, _) = ty_value else {
+            let ValueRef::Text(ty) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let ty = String::from_utf8_lossy(ty);
-            let ValueRef::Text(name, _) = record_cursor.get_value(&row, 1)? else {
+            let ValueRef::Text(name) = record_cursor.get_value(&row, 1)? else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let name = String::from_utf8_lossy(name);
             let table_name_value = record_cursor.get_value(&row, 2)?;
-            let ValueRef::Text(table_name, _) = table_name_value else {
+            let ValueRef::Text(table_name) = table_name_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let table_name = String::from_utf8_lossy(table_name);
             let root_page_value = record_cursor.get_value(&row, 3)?;
             let ValueRef::Integer(root_page) = root_page_value else {
                 return Err(LimboError::ConversionError("Expected integer value".into()));
             };
             let sql_value = record_cursor.get_value(&row, 4)?;
             let sql_textref = match sql_value {
-                ValueRef::Text(sql, _) => Some(sql),
+                ValueRef::Text(sql) => Some(sql),
                 _ => None,
             };
-            let sql = sql_textref.map(|s| String::from_utf8_lossy(s));
+            let sql = sql_textref.map(|s| s.as_str());
 
             self.handle_schema_row(
                 &ty,
                 &name,
                 &table_name,
                 root_page,
-                sql.as_deref(),
+                sql,
                 syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,
@@ -484,7 +610,12 @@ impl Schema {
 
         pager.end_read_tx();
 
-        self.populate_indices(from_sql_indexes, automatic_indices)?;
+        self.populate_indices(
+            syms,
+            from_sql_indexes,
+            automatic_indices,
+            mv_cursor.is_some(),
+        )?;
 
         self.populate_materialized_views(
             materialized_view_info,
@@ -500,8 +631,10 @@ impl Schema {
     /// automatic_indices: indices created automatically for primary key and unique constraints
     pub fn populate_indices(
         &mut self,
+        syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             if !self.indexes_enabled() {
@@ -511,10 +644,24 @@ impl Schema {
                     .get_btree_table(&unparsed_sql_from_index.table_name)
                     .unwrap();
                 let index = Index::from_sql(
+                    syms,
                     &unparsed_sql_from_index.sql,
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
                 )?;
+                if mvcc_enabled {
+                    if index.columns.iter().any(|c| c.expr.is_some()) {
+                        crate::bail_parse_error!("Expression indexes are not supported with MVCC");
+                    }
+                    if index.where_clause.is_some() {
+                        crate::bail_parse_error!("Partial indexes are not supported with MVCC");
+                    }
+                    if index.index_method.is_some() {
+                        crate::bail_parse_error!(
+                            "Custom index modules are not supported with MVCC"
+                        );
+                    }
+                }
                 self.add_index(Arc::new(index))?;
             }
         }
@@ -540,8 +687,8 @@ impl Schema {
                         table.name
                     )));
                 };
-                if column.primary_key && unique_set.is_primary_key {
-                    if column.is_rowid_alias {
+                if column.primary_key() && unique_set.is_primary_key {
+                    if column.is_rowid_alias() {
                         // rowid alias, no index needed
                         continue;
                     }
@@ -747,7 +894,6 @@ impl Schema {
                 }
             }
             "index" => {
-                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
@@ -848,6 +994,45 @@ impl Schema {
                     }
                 }
             }
+            "trigger" => {
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+
+                let sql = maybe_sql.expect("sql should be present for trigger");
+                let trigger_name = name.to_string();
+
+                let mut parser = Parser::new(sql.as_bytes());
+                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                    temporary,
+                    if_not_exists: _,
+                    trigger_name: _,
+                    time,
+                    event,
+                    tbl_name,
+                    for_each_row,
+                    when_clause,
+                    commands,
+                }))) = parser.next_cmd()
+                else {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "invalid trigger sql: {sql}"
+                    )));
+                };
+                self.add_trigger(
+                    Trigger::new(
+                        trigger_name.clone(),
+                        sql.to_string(),
+                        tbl_name.name.to_string(),
+                        time,
+                        event,
+                        for_each_row,
+                        when_clause.map(|e| *e),
+                        commands,
+                        temporary,
+                    ),
+                    tbl_name.name.as_str(),
+                )?;
+            }
             _ => {}
         };
 
@@ -945,7 +1130,7 @@ impl Schema {
                         let pk_name = &parent_tbl.primary_key_columns[0].0;
                         // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
                         parent_tbl.columns.iter().any(|c| {
-                            c.is_rowid_alias
+                            c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
                                     .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
@@ -960,14 +1145,11 @@ impl Schema {
                     None
                 } else {
                     find_parent_unique(&parent_cols)
-                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
-                        .into()
                 };
                 fk.validate()?;
                 out.push(ResolvedFkRef {
                     child_table: Arc::clone(&child),
                     fk: Arc::clone(fk),
-                    parent_cols,
                     child_cols,
                     child_pos,
                     parent_pos,
@@ -1051,7 +1233,7 @@ impl Schema {
                 let c = parent_cols[0].as_str();
                 ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c))
                     || parent_tbl.columns.iter().any(|col| {
-                        col.is_rowid_alias
+                        col.is_rowid_alias()
                             && col
                                 .name
                                 .as_deref()
@@ -1083,7 +1265,6 @@ impl Schema {
             out.push(ResolvedFkRef {
                 child_table: Arc::clone(&child),
                 fk: Arc::clone(fk),
-                parent_cols,
                 child_cols,
                 child_pos,
                 parent_pos,
@@ -1194,6 +1375,16 @@ impl Clone for Schema {
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
             .collect();
+        let triggers = self
+            .triggers
+            .iter()
+            .map(|(table_name, triggers)| {
+                (
+                    table_name.clone(),
+                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
+                )
+            })
+            .collect();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -1201,6 +1392,7 @@ impl Clone for Schema {
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes: self.has_indexes.clone(),
             indexes_enabled: self.indexes_enabled,
@@ -1320,7 +1512,7 @@ impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         if self.primary_key_columns.len() == 1 {
             let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias {
+            if col.is_rowid_alias() {
                 return Some((idx, col));
             }
         }
@@ -1358,6 +1550,8 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", self.name);
+        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -1377,15 +1571,14 @@ impl BTreeTable {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
             }
-            if column.notnull {
+            if column.notnull() {
                 sql.push_str(" NOT NULL");
             }
 
-            if column.unique {
+            if column.unique() {
                 sql.push_str(" UNIQUE");
             }
-
-            if column.primary_key {
+            if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
             }
 
@@ -1394,12 +1587,73 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
         }
+
+        let has_table_pk = !self.primary_key_columns.is_empty();
+        // Add table-level PRIMARY KEY constraint if exists
+        if !needs_pk_inline && has_table_pk {
+            sql.push_str(", PRIMARY KEY (");
+            for (i, col) in self.primary_key_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&col.0);
+            }
+            sql.push(')');
+        }
+
+        for fk in &self.foreign_keys {
+            sql.push_str(", FOREIGN KEY (");
+            for (i, col) in fk.child_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push_str(") REFERENCES ");
+            sql.push_str(&fk.parent_table);
+            sql.push('(');
+            for (i, col) in fk.parent_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push(')');
+
+            // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
+            if fk.on_delete != RefAct::NoAction {
+                sql.push_str(" ON DELETE ");
+                sql.push_str(match fk.on_delete {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.on_update != RefAct::NoAction {
+                sql.push_str(" ON UPDATE ");
+                sql.push_str(match fk.on_update {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.deferred {
+                sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+            }
+        }
         sql.push(')');
         sql
     }
 
-    pub fn column_collations(&self) -> Vec<Option<CollationSeq>> {
-        self.columns.iter().map(|column| column.collation).collect()
+    pub fn column_collations(&self) -> Vec<CollationSeq> {
+        self.columns
+            .iter()
+            .map(|column| column.collation())
+            .collect()
     }
 }
 
@@ -1632,11 +1886,24 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
+                        ast::ColumnConstraint::Check { .. } => {
+                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+                        }
+                        ast::ColumnConstraint::Generated { .. } => {
+                            // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
+                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
+                            conflict_clause,
                             ..
                         } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             if !primary_key_columns.is_empty() {
                                 crate::bail_parse_error!(
                                     "table \"{}\" has more than one primary key",
@@ -1655,7 +1922,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 is_primary_key: true,
                             });
                         }
-                        ast::ColumnConstraint::NotNull { nullable, .. } => {
+                        ast::ColumnConstraint::NotNull {
+                            nullable,
+                            conflict_clause,
+                            ..
+                        } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             notnull = !nullable;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
@@ -1664,9 +1940,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
-                        ast::ColumnConstraint::Unique(on_conflict) => {
-                            if on_conflict.is_some() {
-                                unimplemented!("ON CONFLICT not implemented");
+                        ast::ColumnConstraint::Unique(conflict) => {
+                            if conflict.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
                             }
                             unique = true;
                             unique_sets.push(UniqueSet {
@@ -1724,7 +2002,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             };
                             foreign_keys.push(Arc::new(fk));
                         }
-                        _ => {}
                     }
                 }
 
@@ -1740,20 +2017,22 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
-                cols.push(Column {
-                    name: Some(normalize_ident(&name)),
-                    ty,
+                cols.push(Column::new(
+                    Some(normalize_ident(&name)),
                     ty_str,
-                    primary_key,
-                    is_rowid_alias: typename_exactly_integer
-                        && primary_key
-                        && !primary_key_desc_columns_constraint,
-                    notnull,
                     default,
-                    unique,
+                    ty,
                     collation,
-                    hidden: false,
-                });
+                    ColDef {
+                        primary_key,
+                        rowid_alias: typename_exactly_integer
+                            && primary_key
+                            && !primary_key_desc_columns_constraint,
+                        notnull,
+                        unique,
+                        hidden: false,
+                    },
+                ));
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
                 has_rowid = false;
@@ -1766,7 +2045,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     // or if the table has no rowid
     if !has_rowid || primary_key_columns.len() > 1 {
         for col in cols.iter_mut() {
-            col.is_rowid_alias = false;
+            col.set_rowid_alias(false);
         }
     }
 
@@ -1779,14 +2058,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
 
         if let Some(col) = pk_col {
-            if col.ty != Type::Integer {
+            if col.ty() != Type::Integer {
                 crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
             }
         }
     }
 
     for col in cols.iter() {
-        if col.is_rowid_alias {
+        if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
             // However, an index IS created for a rowid alias UNIQUE, e.g. CREATE TABLE t(x INTEGER PRIMARY KEY, UNIQUE(x))
             let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
@@ -1912,9 +2191,7 @@ pub struct ResolvedFkRef {
     pub fk: Arc<ForeignKey>,
 
     /// Resolved, normalized column names.
-    pub parent_cols: Vec<String>,
     pub child_cols: Vec<String>,
-
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: Vec<usize>,
     pub parent_pos: Vec<usize>,
@@ -1939,7 +2216,7 @@ impl ResolvedFkRef {
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, c)| c.is_rowid_alias)
+                .find(|(_, c)| c.is_rowid_alias())
             {
                 return updated_parent_positions.contains(&idx);
             }
@@ -1967,7 +2244,7 @@ impl ResolvedFkRef {
         // special case: if FK uses a rowid alias on child, and rowid changed
         if self.child_cols.len() == 1 {
             let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
-            if col.is_rowid_alias && updated_child_positions.contains(&i) {
+            if col.is_rowid_alias() && updated_child_positions.contains(&i) {
                 return true;
             }
         }
@@ -1978,21 +2255,182 @@ impl ResolvedFkRef {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
-    pub ty: Type,
-    // many sqlite operations like table_info retain the original string
     pub ty_str: String,
-    pub primary_key: bool,
-    pub is_rowid_alias: bool,
-    pub notnull: bool,
     pub default: Option<Box<Expr>>,
+    raw: u16,
+}
+
+#[derive(Default)]
+pub struct ColDef {
+    pub primary_key: bool,
+    pub rowid_alias: bool,
+    pub notnull: bool,
     pub unique: bool,
-    pub collation: Option<CollationSeq>,
     pub hidden: bool,
 }
 
+// flags
+const F_PRIMARY_KEY: u16 = 1;
+const F_ROWID_ALIAS: u16 = 2;
+const F_NOTNULL: u16 = 4;
+const F_UNIQUE: u16 = 8;
+const F_HIDDEN: u16 = 16;
+
+// pack Type and Collation in the remaining bits
+const TYPE_SHIFT: u16 = 5;
+const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
+const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
+const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
+
 impl Column {
     pub fn affinity(&self) -> Affinity {
-        affinity(&self.ty_str)
+        Affinity::affinity(&self.ty_str)
+    }
+    pub fn new_default_text(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+    ) -> Self {
+        Self::new(name, ty_str, default, Type::Text, None, ColDef::default())
+    }
+    pub fn new_default_integer(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+    ) -> Self {
+        Self::new(
+            name,
+            ty_str,
+            default,
+            Type::Integer,
+            None,
+            ColDef::default(),
+        )
+    }
+    #[inline]
+    pub const fn new(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+        ty: Type,
+        col: Option<CollationSeq>,
+        coldef: ColDef,
+    ) -> Self {
+        let mut raw = 0u16;
+        raw |= (ty as u16) << TYPE_SHIFT;
+        if let Some(c) = col {
+            raw |= (c as u16) << COLL_SHIFT;
+        }
+        if coldef.primary_key {
+            raw |= F_PRIMARY_KEY
+        }
+        if coldef.rowid_alias {
+            raw |= F_ROWID_ALIAS
+        }
+        if coldef.notnull {
+            raw |= F_NOTNULL
+        }
+        if coldef.unique {
+            raw |= F_UNIQUE
+        }
+        if coldef.hidden {
+            raw |= F_HIDDEN
+        }
+        Self {
+            name,
+            ty_str,
+            default,
+            raw,
+        }
+    }
+    #[inline]
+    pub const fn ty(&self) -> Type {
+        let v = ((self.raw & TYPE_MASK) >> TYPE_SHIFT) as u8;
+        Type::from_bits(v)
+    }
+
+    #[inline]
+    pub const fn set_ty(&mut self, ty: Type) {
+        self.raw = (self.raw & !TYPE_MASK) | (((ty as u16) << TYPE_SHIFT) & TYPE_MASK);
+    }
+
+    #[inline]
+    pub const fn collation_opt(&self) -> Option<CollationSeq> {
+        if self.has_explicit_collation() {
+            Some(self.collation())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn collation(&self) -> CollationSeq {
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
+        CollationSeq::from_bits(v)
+    }
+
+    #[inline]
+    pub const fn has_explicit_collation(&self) -> bool {
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
+        v != CollationSeq::Unset as u8
+    }
+
+    #[inline]
+    pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
+        if let Some(c) = c {
+            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+        }
+    }
+
+    #[inline]
+    pub fn primary_key(&self) -> bool {
+        self.raw & F_PRIMARY_KEY != 0
+    }
+    #[inline]
+    pub const fn is_rowid_alias(&self) -> bool {
+        self.raw & F_ROWID_ALIAS != 0
+    }
+    #[inline]
+    pub const fn notnull(&self) -> bool {
+        self.raw & F_NOTNULL != 0
+    }
+    #[inline]
+    pub const fn unique(&self) -> bool {
+        self.raw & F_UNIQUE != 0
+    }
+    #[inline]
+    pub const fn hidden(&self) -> bool {
+        self.raw & F_HIDDEN != 0
+    }
+
+    #[inline]
+    pub const fn set_primary_key(&mut self, v: bool) {
+        self.set_flag(F_PRIMARY_KEY, v);
+    }
+    #[inline]
+    pub const fn set_rowid_alias(&mut self, v: bool) {
+        self.set_flag(F_ROWID_ALIAS, v);
+    }
+    #[inline]
+    pub const fn set_notnull(&mut self, v: bool) {
+        self.set_flag(F_NOTNULL, v);
+    }
+    #[inline]
+    pub const fn set_unique(&mut self, v: bool) {
+        self.set_flag(F_UNIQUE, v);
+    }
+    #[inline]
+    pub const fn set_hidden(&mut self, v: bool) {
+        self.set_flag(F_HIDDEN, v);
+    }
+
+    #[inline]
+    const fn set_flag(&mut self, mask: u16, val: bool) {
+        if val {
+            self.raw |= mask
+        } else {
+            self.raw &= !mask
+        }
     }
 }
 
@@ -2039,196 +2477,46 @@ impl From<&ColumnDefinition> for Column {
 
         let hidden = ty_str.contains("HIDDEN");
 
-        Column {
-            name: Some(normalize_ident(name)),
-            ty,
-            default,
-            notnull,
+        Column::new(
+            Some(normalize_ident(name)),
             ty_str,
-            primary_key,
-            is_rowid_alias: primary_key && matches!(ty, Type::Integer),
-            unique,
+            default,
+            ty,
             collation,
-            hidden,
-        }
+            ColDef {
+                primary_key,
+                rowid_alias: primary_key && matches!(ty, Type::Integer),
+                notnull,
+                unique,
+                hidden,
+            },
+        )
     }
 }
 
-/// 3.1. Determination Of Column Affinity
-/// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
-///
-/// If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-///
-/// If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
-///
-/// If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-///
-/// If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
-///
-/// Otherwise, the affinity is NUMERIC.
-///
-/// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
-pub fn affinity(datatype: &str) -> Affinity {
-    let datatype = datatype.to_ascii_uppercase();
-
-    // Rule 1: INT -> INTEGER affinity
-    if datatype.contains("INT") {
-        return Affinity::Integer;
-    }
-
-    // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
-    if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
-        return Affinity::Text;
-    }
-
-    // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-    if datatype.contains("BLOB") || datatype.is_empty() || datatype.contains("ANY") {
-        return Affinity::Blob;
-    }
-
-    // Rule 4: REAL/FLOA/DOUB -> REAL affinity
-    if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
-        return Affinity::Real;
-    }
-
-    // Rule 5: Otherwise -> NUMERIC affinity
-    Affinity::Numeric
-}
-
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
-    Null,
-    Text,
-    Numeric,
-    Integer,
-    Real,
-    Blob,
+    Null = 0,
+    Text = 1,
+    Numeric = 2,
+    Integer = 3,
+    Real = 4,
+    Blob = 5,
 }
 
-/// # SQLite Column Type Affinities
-///
-/// Each column in an SQLite 3 database is assigned one of the following type affinities:
-///
-/// - **TEXT**
-/// - **NUMERIC**
-/// - **INTEGER**
-/// - **REAL**
-/// - **BLOB**
-///
-/// > **Note:** Historically, the "BLOB" type affinity was called "NONE". However, this term was renamed to avoid confusion with "no affinity".
-///
-/// ## Affinity Descriptions
-///
-/// ### **TEXT**
-/// - Stores data using the NULL, TEXT, or BLOB storage classes.
-/// - Numerical data inserted into a column with TEXT affinity is converted into text form before being stored.
-/// - **Example:**
-///   ```sql
-///   CREATE TABLE example (col TEXT);
-///   INSERT INTO example (col) VALUES (123); -- Stored as '123' (text)
-///   SELECT typeof(col) FROM example; -- Returns 'text'
-///   ```
-///
-/// ### **NUMERIC**
-/// - Can store values using all five storage classes.
-/// - Text data is converted to INTEGER or REAL (in that order of preference) if it is a well-formed integer or real literal.
-/// - If the text represents an integer too large for a 64-bit signed integer, it is converted to REAL.
-/// - If the text is not a well-formed literal, it is stored as TEXT.
-/// - Hexadecimal integer literals are stored as TEXT for historical compatibility.
-/// - Floating-point values that can be exactly represented as integers are converted to integers.
-/// - **Example:**
-///   ```sql
-///   CREATE TABLE example (col NUMERIC);
-///   INSERT INTO example (col) VALUES ('3.0e+5'); -- Stored as 300000 (integer)
-///   SELECT typeof(col) FROM example; -- Returns 'integer'
-///   ```
-///
-/// ### **INTEGER**
-/// - Behaves like NUMERIC affinity but differs in `CAST` expressions.
-/// - **Example:**
-///   ```sql
-///   CREATE TABLE example (col INTEGER);
-///   INSERT INTO example (col) VALUES (4.0); -- Stored as 4 (integer)
-///   SELECT typeof(col) FROM example; -- Returns 'integer'
-///   ```
-///
-/// ### **REAL**
-/// - Similar to NUMERIC affinity but forces integer values into floating-point representation.
-/// - **Optimization:** Small floating-point values with no fractional component may be stored as integers on disk to save space. This is invisible at the SQL level.
-/// - **Example:**
-///   ```sql
-///   CREATE TABLE example (col REAL);
-///   INSERT INTO example (col) VALUES (4); -- Stored as 4.0 (real)
-///   SELECT typeof(col) FROM example; -- Returns 'real'
-///   ```
-///
-/// ### **BLOB**
-/// - Does not prefer any storage class.
-/// - No coercion is performed between storage classes.
-/// - **Example:**
-///   ```sql
-///   CREATE TABLE example (col BLOB);
-///   INSERT INTO example (col) VALUES (x'1234'); -- Stored as a binary blob
-///   SELECT typeof(col) FROM example; -- Returns 'blob'
-///   ```
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Affinity {
-    Integer,
-    Text,
-    Blob,
-    Real,
-    Numeric,
-}
-
-pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
-pub const SQLITE_AFF_TEXT: char = 'B';
-pub const SQLITE_AFF_NUMERIC: char = 'C';
-pub const SQLITE_AFF_INTEGER: char = 'D';
-pub const SQLITE_AFF_REAL: char = 'E';
-
-impl Affinity {
-    /// This is meant to be used in opcodes like Eq, which state:
-    ///
-    /// "The SQLITE_AFF_MASK portion of P5 must be an affinity character - SQLITE_AFF_TEXT, SQLITE_AFF_INTEGER, and so forth.
-    /// An attempt is made to coerce both inputs according to this affinity before the comparison is made.
-    /// If the SQLITE_AFF_MASK is 0x00, then numeric affinity is used.
-    /// Note that the affinity conversions are stored back into the input registers P1 and P3.
-    /// So this opcode can cause persistent changes to registers P1 and P3.""
-    pub fn aff_mask(&self) -> char {
-        match self {
-            Affinity::Integer => SQLITE_AFF_INTEGER,
-            Affinity::Text => SQLITE_AFF_TEXT,
-            Affinity::Blob => SQLITE_AFF_NONE,
-            Affinity::Real => SQLITE_AFF_REAL,
-            Affinity::Numeric => SQLITE_AFF_NUMERIC,
+impl Type {
+    #[inline]
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Type::Null,
+            1 => Type::Text,
+            2 => Type::Numeric,
+            3 => Type::Integer,
+            4 => Type::Real,
+            5 => Type::Blob,
+            _ => Type::Null,
         }
-    }
-
-    pub fn from_char(char: char) -> Self {
-        match char {
-            SQLITE_AFF_INTEGER => Affinity::Integer,
-            SQLITE_AFF_TEXT => Affinity::Text,
-            SQLITE_AFF_NONE => Affinity::Blob,
-            SQLITE_AFF_REAL => Affinity::Real,
-            SQLITE_AFF_NUMERIC => Affinity::Numeric,
-            _ => Affinity::Blob,
-        }
-    }
-
-    pub fn as_char_code(&self) -> u8 {
-        self.aff_mask() as u8
-    }
-
-    pub fn from_char_code(code: u8) -> Self {
-        Self::from_char(code as char)
-    }
-
-    pub fn is_numeric(&self) -> bool {
-        matches!(self, Affinity::Integer | Affinity::Real | Affinity::Numeric)
-    }
-
-    pub fn has_affinity(&self) -> bool {
-        !matches!(self, Affinity::Blob)
     }
 }
 
@@ -2255,66 +2543,11 @@ pub fn sqlite_schema_table() -> BTreeTable {
         has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
-            Column {
-                name: Some("type".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("name".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("tbl_name".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("rootpage".to_string()),
-                ty: Type::Integer,
-                ty_str: "INT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("sql".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
+            Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
+            Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
+            Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
+            Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
         ],
         foreign_keys: vec![],
         unique_sets: vec![],
@@ -2337,6 +2570,7 @@ pub struct Index {
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
+    pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
 }
 
 #[allow(dead_code)]
@@ -2352,10 +2586,17 @@ pub struct IndexColumn {
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
     pub default: Option<Box<Expr>>,
+    /// Expression for expression indexes. None for simple column indexes.
+    pub expr: Option<Box<Expr>>,
 }
 
 impl Index {
-    pub fn from_sql(sql: &str, root_page: i64, table: &BTreeTable) -> Result<Index> {
+    pub fn from_sql(
+        syms: &SymbolTable,
+        sql: &str,
+        root_page: i64,
+        table: &BTreeTable,
+    ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
@@ -2365,43 +2606,64 @@ impl Index {
                 columns,
                 unique,
                 where_clause,
+                using,
+                with_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let mut index_columns = Vec::with_capacity(columns.len());
-                for col in columns.into_iter() {
-                    let name = normalize_ident(match col.expr.as_ref() {
-                        Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
-                        _ => crate::bail_parse_error!("cannot use expressions in CREATE INDEX"),
-                    });
-                    let Some((pos_in_table, _)) = table.get_column(&name) else {
-                        return Err(crate::LimboError::InternalError(format!(
-                            "Column {} is in index {} but not found in table {}",
-                            name, index_name, table.name
-                        )));
+                let index_columns = resolve_sorted_columns(table, &columns)?;
+                if let Some(using) = using {
+                    if where_clause.is_some() {
+                        bail_parse_error!("custom index module do not support partial indices");
+                    }
+                    if unique {
+                        bail_parse_error!("custom index module do not support UNIQUE indices");
+                    }
+                    let parameters = resolve_index_method_parameters(with_clause)?;
+                    let Some(module) = syms.index_methods.get(using.as_str()) else {
+                        bail_parse_error!("unknown module name: '{}'", using);
                     };
-                    let (_, column) = table.get_column(&name).unwrap();
-                    index_columns.push(IndexColumn {
-                        name,
-                        order: col.order.unwrap_or(SortOrder::Asc),
-                        pos_in_table,
-                        collation: column.collation,
-                        default: column.default.clone(),
-                    });
+                    let configuration = IndexMethodConfiguration {
+                        table_name: table.name.clone(),
+                        index_name: index_name.clone(),
+                        columns: index_columns.clone(),
+                        parameters,
+                    };
+                    let descriptor = module.attach(&configuration)?;
+                    Ok(Index {
+                        name: index_name,
+                        table_name: normalize_ident(tbl_name.as_str()),
+                        root_page,
+                        columns: index_columns,
+                        unique: false,
+                        ephemeral: false,
+                        has_rowid: table.has_rowid,
+                        where_clause: None,
+                        index_method: Some(descriptor),
+                    })
+                } else {
+                    Ok(Index {
+                        name: index_name,
+                        table_name: normalize_ident(tbl_name.as_str()),
+                        root_page,
+                        columns: index_columns,
+                        unique,
+                        ephemeral: false,
+                        has_rowid: table.has_rowid,
+                        where_clause,
+                        index_method: None,
+                    })
                 }
-                Ok(Index {
-                    name: index_name,
-                    table_name: normalize_ident(tbl_name.as_str()),
-                    root_page,
-                    columns: index_columns,
-                    unique,
-                    ephemeral: false,
-                    has_rowid: table.has_rowid,
-                    where_clause,
-                })
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// check if this is special backing_btree index created and managed by custom index_method
+    pub fn is_backing_btree_index(&self) -> bool {
+        self.index_method
+            .as_ref()
+            .is_some_and(|x| x.definition().backing_btree)
     }
 
     pub fn automatic_from_primary_key(
@@ -2427,8 +2689,9 @@ impl Index {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
-                collation: column.collation,
+                collation: column.collation_opt(),
                 default: column.default.clone(),
+                expr: None,
             });
         }
 
@@ -2443,6 +2706,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
+            index_method: None,
         })
     }
 
@@ -2465,8 +2729,9 @@ impl Index {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
                     pos_in_table: *pos_in_table,
-                    collation: col.collation,
+                    collation: col.collation_opt(),
                     default: col.default.clone(),
+                    expr: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -2480,6 +2745,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
+            index_method: None,
         })
     }
 
@@ -2493,6 +2759,17 @@ impl Index {
         self.columns
             .iter()
             .position(|c| c.pos_in_table == table_pos)
+    }
+
+    /// Given an expression, return the position in the index if it matches an expression index column.
+    /// Expression index matching is textual (after binding), so the caller should normalize the query
+    /// expression to resemble the stored index expression (e.g. unqualified column names).
+    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
+        self.columns.iter().position(|c| {
+            c.expr
+                .as_ref()
+                .is_some_and(|e| exprs_are_equivalent(e, expr))
+        })
     }
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
@@ -2585,14 +2862,12 @@ impl Index {
         let Some(where_clause) = &self.where_clause else {
             return None;
         };
-        let mut params = ParamState::disallow();
         let mut expr = where_clause.clone();
         bind_and_rewrite_expr(
             &mut expr,
             table_refs,
             None,
             connection,
-            &mut params,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;
@@ -2626,7 +2901,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ has type different than INTEGER so can't be a rowid alias"
         );
         Ok(())
@@ -2637,7 +2912,10 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
+        assert!(
+            column.is_rowid_alias(),
+            "column 'a´ should be a rowid alias"
+        );
         Ok(())
     }
 
@@ -2647,7 +2925,10 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
+        assert!(
+            column.is_rowid_alias(),
+            "column 'a´ should be a rowid alias"
+        );
         Ok(())
     }
 
@@ -2658,7 +2939,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2670,7 +2951,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2693,7 +2974,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has composite primary key"
         );
         Ok(())
@@ -2704,11 +2985,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2733,11 +3020,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Desc)],
             table.primary_key_columns,
@@ -2751,11 +3044,14 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
+        assert!(column.primary_key(), "column 'b' shouldn be a primary key");
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![
                 ("a".to_string(), SortOrder::Asc),
@@ -2772,11 +3068,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY('a'));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2789,11 +3091,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY("a"));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2817,7 +3125,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.notnull);
+        assert!(column.notnull());
         Ok(())
     }
 
@@ -2826,7 +3134,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(!column.notnull);
+        assert!(!column.notnull());
         Ok(())
     }
 
@@ -2914,18 +3222,11 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
-            columns: vec![Column {
-                name: Some("a".to_string()),
-                ty: Type::Integer,
-                ty_str: "INT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
+            columns: vec![Column::new_default_integer(
+                Some("a".to_string()),
+                "INT".to_string(),
+                None,
+            )],
             unique_sets: vec![],
             foreign_keys: vec![],
         };

@@ -5,11 +5,12 @@ use crate::{
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
-    storage::btree::BTreeCursor,
+    storage::btree::CursorTrait,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// State machine for seek operations
 #[derive(Debug)]
@@ -35,7 +36,7 @@ enum SeekState {
 /// and overlays transaction changes as needed.
 pub struct MaterializedViewCursor {
     // Core components
-    btree_cursor: Box<BTreeCursor>,
+    btree_cursor: Box<dyn CursorTrait>,
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
 
@@ -62,7 +63,7 @@ pub struct MaterializedViewCursor {
 
 impl MaterializedViewCursor {
     pub fn new(
-        btree_cursor: Box<BTreeCursor>,
+        btree_cursor: Box<dyn CursorTrait>,
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         tx_state: Arc<ViewTransactionState>,
@@ -89,7 +90,7 @@ impl MaterializedViewCursor {
         }
 
         // Get the view and the current transaction state
-        let mut view_guard = self.view.lock().unwrap();
+        let mut view_guard = self.view.lock();
         let table_deltas = self.tx_state.get_table_deltas();
 
         // Process the deltas through the circuit to get materialized changes
@@ -296,6 +297,7 @@ impl MaterializedViewCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::btree::BTreeCursor;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
     use std::sync::Arc;
@@ -315,6 +317,8 @@ mod tests {
                 enable_strict: false,
                 enable_load_extension: false,
                 enable_encryption: false,
+                enable_index_method: false,
+                enable_autovacuum: false,
             },
             None,
         )?;
@@ -347,7 +351,7 @@ mod tests {
             ))?;
 
         // Get the view's root page
-        let view = view_mutex.lock().unwrap();
+        let view = view_mutex.lock();
         let root_page = view.get_root_page();
         if root_page == 0 {
             return Err(crate::LimboError::InternalError(
@@ -359,12 +363,7 @@ mod tests {
 
         // Create a btree cursor
         let pager = conn.get_pager();
-        let btree_cursor = Box::new(BTreeCursor::new(
-            None, // No MvCursor
-            pager.clone(),
-            root_page,
-            num_columns,
-        ));
+        let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
         let tx_state = conn.view_transaction_states.get_or_create("test_view");

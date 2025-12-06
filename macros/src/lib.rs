@@ -1,5 +1,8 @@
-mod ext;
 extern crate proc_macro;
+mod atomic_enum;
+mod ext;
+mod test;
+
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
 
@@ -131,7 +134,7 @@ fn generate_get_description(
     }
 
     let enum_impl = format!(
-        "impl {enum_name}  {{ 
+        "impl {enum_name}  {{
      pub fn get_description(&self) -> Option<&str> {{
      match self {{
      {all_enum_arms}
@@ -139,7 +142,9 @@ fn generate_get_description(
      }}
      }}"
     );
-    enum_impl.parse().unwrap()
+    enum_impl
+        .parse()
+        .expect("generated code should be valid Rust")
 }
 
 /// Register your extension with 'core' by providing the relevant functions
@@ -463,4 +468,60 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
     ext::match_ignore_ascci_case(input)
+}
+
+/// Derive macro for creating atomic wrappers for enums
+///
+/// Supports:
+/// - Unit variants
+/// - Variants with single bool/u8/i8 fields
+/// - Named or unnamed fields
+///
+/// Algorithm:
+/// - Uses u8 representation, splitting bits for variant discriminant and field data
+/// - For bool fields: high bit for bool, lower 7 bits for discriminant
+/// - For u8/i8 fields: uses u16 internally (8 bits discriminant, 8 bits data)
+///
+/// Example:
+/// ```ignore
+/// #[derive(AtomicEnum)]
+/// enum TransactionState {
+///     Write { schema_did_change: bool },
+///     Read,
+///     PendingUpgrade,
+///     None,
+/// }
+/// ```
+#[proc_macro_derive(AtomicEnum)]
+pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
+    atomic_enum::derive_atomic_enum_inner(input)
+}
+
+/// Test macro for `core_tester` crate
+///
+/// Generates a runnable Rust test from the following function signature
+///
+/// ```no_run
+/// fn test_x(db: TempDatabase) -> Result<()> {}
+/// // Or
+/// fn test_y(db: TempDatabase) {}
+/// ```
+///
+/// Macro accepts the following arguments
+///
+/// - `mvcc` flag: creates an additional test that will run the same code with MVCC enabled
+/// - `path` arg: specifies the name of the database to be created
+/// - `init_sql` arg: specifies the SQL query that will be run by `rusqlite` before initializing the Turso database
+///
+/// Example:
+/// ```no_run,rust
+/// #[turso_macros::test(mvcc, path = "test.db", init_sql = "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);")]
+/// fn test_integer_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
+///     // Code goes here to test
+///     Ok(())
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
+    test::test_macro_attribute(args, input)
 }

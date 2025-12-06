@@ -1,5 +1,3 @@
-use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
-
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -133,7 +131,9 @@ pub fn emit_result_row_and_limit(
                 key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
                 record_reg,
                 // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
-                flag: InsertFlags::new().require_seek(),
+                flag: InsertFlags::new()
+                    .require_seek()
+                    .is_ephemeral_table_insert(),
                 table_name: table.name.clone(),
             });
         }
@@ -143,6 +143,36 @@ pub fn emit_result_row_and_limit(
                 end_offset: BranchOffset::Offset(0),
             });
         }
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: *result_reg,
+            });
+        }
+        QueryDestination::RowValueSubqueryResult {
+            result_reg_start,
+            num_regs,
+        } => {
+            assert!(plan.result_columns.len() == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            program.emit_insn(Insn::Copy {
+                src_reg: result_columns_start_reg,
+                dst_reg: *result_reg_start,
+                extra_amount: num_regs - 1,
+            });
+        }
+        QueryDestination::RowSet { rowset_reg } => {
+            // For RowSet, we add the rowid (which should be the only result column) to the RowSet
+            assert_eq!(
+                plan.result_columns.len(),
+                1,
+                "RowSet should only have one result column (rowid)"
+            );
+            program.emit_insn(Insn::RowSetAdd {
+                rowset_reg: *rowset_reg,
+                value_reg: result_columns_start_reg,
+            });
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
 
     if plan.limit.is_some() {
@@ -171,37 +201,4 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
         target_pc: jump_to,
         decrement_by: 1,
     });
-}
-
-#[allow(clippy::borrowed_box)]
-pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
-    match expr.as_ref() {
-        Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
-        Expr::Literal(Literal::Null) => Some(0),
-        Expr::Id(name) if !name.quoted() => {
-            let lowered = name.as_str();
-            if lowered == "true" {
-                Some(1)
-            } else if lowered == "false" {
-                Some(0)
-            } else {
-                None
-            }
-        }
-        Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
-        Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
-        Expr::Binary(left, op, right) => {
-            let l = try_fold_expr_to_i64(left)?;
-            let r = try_fold_expr_to_i64(right)?;
-            match op {
-                Operator::Add => Some(l.saturating_add(r)),
-                Operator::Subtract => Some(l.saturating_sub(r)),
-                Operator::Multiply => Some(l.saturating_mul(r)),
-                Operator::Divide if r != 0 => Some(l.saturating_div(r)),
-                _ => None,
-            }
-        }
-
-        _ => None,
-    }
 }

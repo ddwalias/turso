@@ -17,6 +17,7 @@ pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
+pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
@@ -35,6 +36,8 @@ pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
+pub(crate) mod trigger;
+pub(crate) mod trigger_exec;
 pub(crate) mod update;
 pub(crate) mod upsert;
 mod values;
@@ -93,14 +96,14 @@ pub fn translate(
     );
 
     program.prologue();
-    let resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(schema, syms);
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
             pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
         }
-        stmt => translate_inner(stmt, &resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -113,7 +116,7 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 pub fn translate_inner(
     stmt: ast::Stmt,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     program: ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
@@ -152,23 +155,9 @@ pub fn translate_inner(
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
         ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
-        ast::Stmt::CreateIndex {
-            unique,
-            if_not_exists,
-            idx_name,
-            tbl_name,
-            columns,
-            where_clause,
-        } => translate_create_index(
-            (unique, if_not_exists),
-            resolver,
-            &idx_name.name,
-            &tbl_name,
-            &columns,
-            program,
-            connection,
-            where_clause,
-        )?,
+        ast::Stmt::CreateIndex { .. } => {
+            translate_create_index(program, connection, resolver, stmt)?
+        }
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
@@ -183,7 +172,40 @@ pub fn translate_inner(
             program,
             connection,
         )?,
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
+        ast::Stmt::CreateTrigger {
+            temporary,
+            if_not_exists,
+            trigger_name,
+            time,
+            event,
+            tbl_name,
+            for_each_row,
+            when_clause,
+            commands,
+        } => {
+            // Reconstruct SQL for storage
+            let sql = trigger::create_trigger_to_sql(
+                temporary,
+                if_not_exists,
+                &trigger_name,
+                time,
+                &event,
+                &tbl_name,
+                for_each_row,
+                when_clause.as_deref(),
+                &commands,
+            );
+            trigger::translate_create_trigger(
+                trigger_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                time,
+                tbl_name,
+                program,
+                sql,
+            )?
+        }
         ast::Stmt::CreateView {
             view_name,
             select,
@@ -245,8 +267,16 @@ pub fn translate_inner(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program)?,
-        ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
+        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        ast::Stmt::DropTrigger {
+            if_exists,
+            trigger_name,
+        } => trigger::translate_drop_trigger(
+            resolver.schema,
+            trigger_name.name.as_str(),
+            if_exists,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
@@ -273,9 +303,7 @@ pub fn translate_inner(
             )?
             .program
         }
-        ast::Stmt::Update(mut update) => {
-            translate_update(&mut update, resolver, program, connection)?
-        }
+        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
         ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert {
             with,
@@ -284,17 +312,21 @@ pub fn translate_inner(
             columns,
             body,
             returning,
-        } => translate_insert(
-            with,
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            program,
-            connection,
-        )?,
+        } => {
+            if with.is_some() {
+                crate::bail_parse_error!("WITH clause is not supported");
+            }
+            translate_insert(
+                resolver,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+                program,
+                connection,
+            )?
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction

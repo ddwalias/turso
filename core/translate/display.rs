@@ -12,7 +12,7 @@ use turso_parser::{
 use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
-    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Search, SelectPlan,
+    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SelectPlan,
     UpdatePlan,
 };
 
@@ -92,14 +92,37 @@ impl Display for SelectPlan {
             };
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{indent}SCAN {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}SCAN {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}SCAN {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}SCAN {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            writeln!(f, "{indent}SCAN {table_name}")?;
+                        }
+                    }
                 }
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
@@ -119,6 +142,18 @@ impl Display for SelectPlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let index_method = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY INDEX METHOD {}",
+                        indent,
+                        index_method.definition().method_name
+                    )?;
+                }
+                Operation::HashJoin(_) => {
+                    writeln!(f, "{indent}HASH JOIN")?;
+                }
             }
         }
         Ok(())
@@ -134,14 +169,37 @@ impl Display for DeletePlan {
             let indent = "`--";
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}DELETE FROM {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}DELETE FROM {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                        }
+                    }
                 }
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
@@ -161,6 +219,18 @@ impl Display for DeletePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
+                Operation::HashJoin(_) => {
+                    unreachable!("Delete plan should not have hash joins");
+                }
             }
         }
         Ok(())
@@ -184,17 +254,41 @@ impl fmt::Display for UpdatePlan {
             };
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    if i == 0 {
-                        writeln!(f, "{indent}UPDATE {table_name}")?;
-                    } else {
-                        writeln!(f, "{indent}SCAN {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            let action = if i == 0 { "UPDATE" } else { "SCAN" };
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}{action} {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}{action} {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}{action} {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            if i == 0 {
+                                writeln!(f, "{indent}UPDATE {table_name}")?;
+                            } else {
+                                writeln!(f, "{indent}SCAN {table_name}")?;
+                            }
+                        }
                     }
                 }
                 Operation::Search(search) => match search {
@@ -215,6 +309,18 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
+                Operation::HashJoin(_) => {
+                    unreachable!("Update plan should not have hash joins");
+                }
             }
         }
         if !self.order_by.is_empty() {
@@ -251,7 +357,7 @@ pub struct PlanContext<'a>(pub &'a [&'a TableReferences]);
 // Definitely not perfect yet
 impl ToSqlContext for PlanContext<'_> {
     fn get_column_name(&self, table_id: TableInternalId, col_idx: usize) -> Option<Option<&str>> {
-        let table = self
+        let (_, table) = self
             .0
             .iter()
             .find_map(|table_ref| table_ref.find_table_by_internal_id(table_id))?;
@@ -270,7 +376,8 @@ impl ToSqlContext for PlanContext<'_> {
         match (joined_table, outer_query) {
             (Some(table), None) => Some(&table.identifier),
             (None, Some(table)) => Some(&table.identifier),
-            _ => unreachable!(),
+            (Some(table), Some(_)) => Some(&table.identifier),
+            (None, None) => unreachable!(),
         }
     }
 }

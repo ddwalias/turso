@@ -235,11 +235,15 @@ impl SimulatorEnv {
         }
         self.db = None;
 
-        let db = match Database::open_file(
+        let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
-            self.profile.experimental_mvcc,
-            self.profile.query.gen_opts.indexes,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_mvcc(self.profile.experimental_mvcc)
+                .with_indexes(self.profile.query.gen_opts.indexes)
+                .with_autovacuum(true),
+            None,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -298,8 +302,7 @@ impl SimulatorEnv {
 
         let mut opts = SimulatorOpts {
             seed,
-            ticks: rng
-                .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
+            ticks: usize::MAX,
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
             disable_double_create_failure: cli_opts.disable_double_create_failure,
@@ -382,11 +385,15 @@ impl SimulatorEnv {
             )
         };
 
-        let db = match Database::open_file(
+        let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
-            profile.experimental_mvcc,
-            profile.query.gen_opts.indexes,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_mvcc(profile.experimental_mvcc)
+                .with_indexes(profile.query.gen_opts.indexes)
+                .with_autovacuum(true),
+            None,
         ) {
             Ok(db) => db,
             Err(e) => {

@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -13,18 +13,30 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use crate::{
-    schema::{Index, IndexColumn, Schema, Table},
+    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
+        insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
-        plan::{Scan, SeekKeyComponent},
+        plan::{
+            ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
+            OuterQueryReference, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+        },
+        trigger_exec::has_relevant_triggers_type_only,
     },
     types::SeekOp,
+    util::{
+        exprs_are_equivalent, simple_bind_expr, try_capture_parameters, try_substitute_parameters,
+    },
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, CursorType, ProgramBuilder},
+    },
     LimboError, Result,
 };
 
@@ -44,11 +56,11 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
+pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(plan, schema)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, schema)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -80,11 +92,15 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     let best_join_order = optimize_table_access(
         schema,
+        &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
+        &plan.non_from_clause_subqueries,
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
     if let Some(best_join_order) = best_join_order {
@@ -103,19 +119,31 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(rowset_plan) = plan.rowset_plan.as_mut() {
+        optimize_select_plan(rowset_plan, schema)?;
+    }
+
     let _ = optimize_table_access(
         schema,
+        &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &[],
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
+fn optimize_update_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut UpdatePlan,
+    schema: &Schema,
+) -> Result<()> {
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -125,35 +153,191 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
     }
     let _ = optimize_table_access(
         schema,
+        &mut [],
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &[],
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
-    // It is not safe to use an index that is going to be updated as the iteration index for a table.
-    // In these cases, we will fall back to a table scan.
-    // FIXME: this should probably be incorporated into the optimizer itself, but it's a smaller fix this way.
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
 
-    // No index, OK.
-    let Some(index) = table_ref.op.index() else {
-        return Ok(());
+    // An ephemeral table is required if:
+    // 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
+    //    For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
+    //    For index scans and seeks, this is any column in the index used.
+    // 2. There are UPDATE triggers on the table. This is done in SQLite for all UPDATE triggers on
+    //    the affected table even if the trigger would not have an impact on the target table --
+    //    presumably due to lack of static analysis capabilities to determine whether it's safe
+    //    to skip the rowset materialization.
+    let requires_ephemeral_table = 'requires: {
+        let Some(btree_table_arc) = table_ref.table.btree() else {
+            break 'requires false;
+        };
+        let btree_table = btree_table_arc.as_ref();
+
+        // Check if there are UPDATE triggers
+        let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+        if has_relevant_triggers_type_only(
+            schema,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
+            break 'requires true;
+        }
+
+        let Some(index) = table_ref.op.index() else {
+            let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+            });
+            if rowid_alias_used {
+                break 'requires true;
+            }
+            let direct_rowid_update = plan
+                .set_clauses
+                .iter()
+                .any(|(idx, _)| *idx == ROWID_SENTINEL);
+            if direct_rowid_update {
+                break 'requires true;
+            }
+            break 'requires false;
+        };
+
+        plan.set_clauses
+            .iter()
+            .any(|(idx, _)| index.columns.iter().any(|c| c.pos_in_table == *idx))
     };
-    // Iteration index not affected by update, OK.
-    if !plan.indexes_to_update.iter().any(|i| Arc::ptr_eq(index, i)) {
+
+    if !requires_ephemeral_table {
         return Ok(());
     }
-    // Otherwise, fall back to a table scan.
-    table_ref.op = Operation::Scan(Scan::BTreeTable {
-        iter_dir: IterationDirection::Forwards,
-        index: None,
+
+    add_ephemeral_table_to_update_plan(program, plan)
+}
+
+/// An ephemeral table is required if:
+/// 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
+///    For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
+///    For index scans and seeks, the key is any column in the index used.
+/// 2. There are UPDATE triggers on the table (SQLite always uses ephemeral tables when triggers exist).
+///
+/// The ephemeral table will accumulate all the rowids of the rows that are affected by the UPDATE,
+/// and then the temp table will be iterated over and the actual row updates performed.
+///
+/// This is necessary because an UPDATE is implemented as a DELETE-then-INSERT operation, which could
+/// mess up the iteration order of the rows by changing the keys in the table/index that the iteration
+/// is performed over. The ephemeral table ensures stable iteration because it is not modified during
+/// the UPDATE loop.
+fn add_ephemeral_table_to_update_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut UpdatePlan,
+) -> Result<()> {
+    let internal_id = program.table_reference_counter.next();
+    let ephemeral_table = Arc::new(BTreeTable {
+        root_page: 0, // Not relevant for ephemeral table definition
+        name: "ephemeral_scratch".to_string(),
+        has_rowid: true,
+        has_autoincrement: false,
+        primary_key_columns: vec![],
+        columns: vec![ROWID_COLUMN],
+        is_strict: false,
+        unique_sets: vec![],
+        foreign_keys: vec![],
     });
-    // Revert the decision to use a WHERE clause term as an index constraint.
-    plan.where_clause
-        .iter_mut()
-        .for_each(|term| term.consumed = false);
+
+    let temp_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(internal_id),
+        CursorType::BTreeTable(ephemeral_table.clone()),
+    );
+
+    // The actual update loop will use the ephemeral table as the single [JoinedTable] which it then loops over.
+    let table_references_update = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(ephemeral_table.clone()),
+            identifier: "ephemeral_scratch".to_string(),
+            internal_id,
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+
+    // Building the ephemeral table will use the TableReferences from the original plan -- i.e. if we chose an index scan originally,
+    // we will build the ephemeral table by using the same index scan and using the same WHERE filters.
+    let table_references_ephemeral_select =
+        std::mem::replace(&mut plan.table_references, table_references_update);
+
+    for table in table_references_ephemeral_select.joined_tables() {
+        // The update loop needs to reference columns from the original source table, so we add it as an outer query reference.
+        plan.table_references
+            .add_outer_query_reference(OuterQueryReference {
+                identifier: table.identifier.clone(),
+                internal_id: table.internal_id,
+                table: table.table.clone(),
+                col_used_mask: table.col_used_mask.clone(),
+            });
+    }
+
+    let join_order = table_references_ephemeral_select
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: t
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        })
+        .collect();
+    let rowid_internal_id = table_references_ephemeral_select
+        .joined_tables()
+        .first()
+        .unwrap()
+        .internal_id;
+
+    let ephemeral_plan = SelectPlan {
+        table_references: table_references_ephemeral_select,
+        result_columns: vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: rowid_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }],
+        where_clause: plan.where_clause.drain(..).collect(),
+        group_by: None,     // N/A
+        order_by: vec![],   // N/A
+        aggregates: vec![], // N/A
+        limit: None,        // N/A
+        query_destination: QueryDestination::EphemeralTable {
+            cursor_id: temp_cursor_id,
+            table: ephemeral_table,
+        },
+        join_order,
+        offset: None,
+        contains_constant_false_condition: false,
+        distinctness: super::plan::Distinctness::NonDistinct,
+        values: vec![],
+        window: None,
+        non_from_clause_subqueries: vec![],
+    };
+
+    plan.ephemeral_plan = Some(ephemeral_plan);
 
     Ok(())
 }
@@ -168,6 +352,220 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn optimize_table_access_with_custom_modules(
+    schema: &Schema,
+    result_columns: &mut [ResultSetColumn],
+    table_references: &mut TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    where_query: &mut [WhereTerm],
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    group_by: &mut Option<GroupBy>,
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
+) -> Result<bool> {
+    let tables = table_references.joined_tables_mut();
+    assert_eq!(tables.len(), 1);
+
+    // group by is not supported for now
+    if group_by.is_some() {
+        return Ok(false);
+    }
+
+    let table = &mut tables[0];
+    let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+        return Ok(false);
+    };
+    for index in indexes {
+        let Some(module) = &index.index_method else {
+            continue;
+        };
+        if index.is_backing_btree_index() {
+            continue;
+        }
+        let definition = module.definition();
+        'pattern: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            let mut pattern = pattern.clone();
+            assert!(pattern.with.is_none());
+            assert!(pattern.body.compounds.is_empty());
+            let ast::OneSelect::Select {
+                columns,
+                from: Some(ast::FromClause { select, joins }),
+                distinctness: None,
+                ref mut where_clause,
+                group_by: None,
+                window_clause,
+            } = &mut pattern.body.select
+            else {
+                panic!("unexpected select pattern body");
+            };
+            assert!(window_clause.is_empty());
+            assert!(joins.is_empty());
+            let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
+                panic!("unexpected from clause");
+            };
+
+            for column in columns.iter_mut() {
+                if let ast::ResultColumn::Expr(e, _) = column {
+                    simple_bind_expr(schema, table, &[], e)?;
+                }
+            }
+            for column in pattern.order_by.iter_mut() {
+                simple_bind_expr(schema, table, columns, &mut column.expr)?;
+            }
+            if let Some(pattern_where) = where_clause {
+                simple_bind_expr(schema, table, columns, pattern_where)?;
+            }
+
+            if name.name.as_str() != table.table.get_name() {
+                continue;
+            }
+            if order_by.len() != pattern.order_by.len() {
+                continue;
+            }
+
+            let mut where_query_covered = None;
+            let mut parameters = HashMap::new();
+
+            for (pattern_column, (query_column, query_order)) in
+                pattern.order_by.iter().zip(order_by.iter())
+            {
+                if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                    continue 'pattern;
+                }
+                let Some(captured) = try_capture_parameters(&pattern_column.expr, query_column)
+                else {
+                    continue 'pattern;
+                };
+                parameters.extend(captured);
+            }
+            match (pattern.limit.as_ref().map(|x| &x.expr), &limit) {
+                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(pattern_limit), Some(query_limit)) => {
+                    let Some(captured) = try_capture_parameters(pattern_limit, query_limit) else {
+                        continue 'pattern;
+                    };
+                    parameters.extend(captured);
+                }
+                (None, None) => {}
+            }
+            match (
+                pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
+                &offset,
+            ) {
+                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(pattern_off), Some(query_off)) => {
+                    let Some(captured) = try_capture_parameters(pattern_off, query_off) else {
+                        continue 'pattern;
+                    };
+                    parameters.extend(captured);
+                }
+                (None, None) => {}
+            }
+            if let Some(pattern_where) = where_clause {
+                for (i, query_where) in where_query.iter().enumerate() {
+                    let captured = try_capture_parameters(pattern_where, &query_where.expr);
+                    let Some(captured) = captured else {
+                        continue;
+                    };
+                    parameters.extend(captured);
+                    where_query_covered = Some(i);
+                    break;
+                }
+            }
+
+            if where_clause.is_some() && where_query_covered.is_none() {
+                continue;
+            }
+
+            let where_covered_completely =
+                where_query.is_empty() || where_query_covered.is_some() && where_query.len() == 1;
+
+            if !where_covered_completely
+                && (!order_by.is_empty() || limit.is_some() || offset.is_some())
+            {
+                continue;
+            }
+
+            if let Some(where_covered) = where_query_covered {
+                where_query[where_covered].consumed = true;
+            }
+
+            // todo: fix this
+            let mut covered_column_id = 1_000_000;
+            let mut covered_columns = HashMap::new();
+            for (patter_column_id, pattern_column) in columns.iter().enumerate() {
+                let ast::ResultColumn::Expr(pattern, _) = pattern_column else {
+                    continue;
+                };
+                let Some(pattern) = try_substitute_parameters(pattern, &parameters) else {
+                    continue;
+                };
+                for query_column in result_columns.iter_mut() {
+                    if !exprs_are_equivalent(&query_column.expr, &pattern) {
+                        continue;
+                    }
+                    query_column.expr = ast::Expr::Column {
+                        database: None,
+                        table: table.internal_id,
+                        column: covered_column_id,
+                        is_rowid_alias: false,
+                    };
+                    covered_columns.insert(covered_column_id, patter_column_id);
+                    covered_column_id += 1;
+                }
+            }
+            let _ = order_by.drain(..);
+            let _ = limit.take();
+            let _ = offset.take();
+            let mut arguments = parameters.iter().collect::<Vec<_>>();
+            arguments.sort_by_key(|(&i, _)| i);
+
+            table.op = Operation::IndexMethodQuery(IndexMethodQuery {
+                index: index.clone(),
+                pattern_idx,
+                covered_columns,
+                arguments: arguments.iter().map(|(_, e)| (*e).clone()).collect(),
+            });
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// We do a single pass over projected, grouping, and ordering expressions to
+/// capture every expression that could be served directly from an expression index.
+/// Example:
+///   CREATE INDEX idx ON t(lower(a));
+///   SELECT lower(a) FROM t ORDER BY lower(a);
+/// Both the SELECT list and ORDER BY can be covered by idx, avoiding a
+/// table cursor entirely. Recording them upfront lets both the cost model
+/// and covering checks reuse the same facts.
+fn register_expression_index_usages_for_plan(
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    group_by: Option<&GroupBy>,
+) {
+    table_references.reset_expression_index_usages();
+    for rc in result_columns {
+        table_references.register_expression_index_usage(&rc.expr);
+    }
+    for (expr, _) in order_by {
+        table_references.register_expression_index_usage(expr);
+    }
+    if let Some(group_by) = group_by {
+        for expr in &group_by.exprs {
+            table_references.register_expression_index_usage(expr);
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                table_references.register_expression_index_usage(expr);
+            }
+        }
+    }
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -179,13 +577,18 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// - Removes sorting operations if the selected join order and access methods satisfy the [crate::translate::optimizer::order::OrderTarget].
 ///
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
+#[allow(clippy::too_many_arguments)]
 fn optimize_table_access(
     schema: &Schema,
+    result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
+    subqueries: &[NonFromClauseSubquery],
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
@@ -193,10 +596,39 @@ fn optimize_table_access(
             TableReferences::MAX_JOINED_TABLES
         );
     }
+
+    register_expression_index_usages_for_plan(
+        table_references,
+        result_columns,
+        order_by.as_slice(),
+        group_by.as_ref(),
+    );
+
+    if table_references.joined_tables().len() == 1 {
+        let optimized = optimize_table_access_with_custom_modules(
+            schema,
+            result_columns,
+            table_references,
+            available_indexes,
+            where_clause,
+            order_by,
+            group_by,
+            limit,
+            offset,
+        )?;
+        if optimized {
+            return Ok(None);
+        }
+    }
+
     let access_methods_arena = RefCell::new(Vec::new());
-    let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
-    let constraints_per_table =
-        constraints_from_where_clause(where_clause, table_references, available_indexes)?;
+    let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
+    let constraints_per_table = constraints_from_where_clause(
+        where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+    )?;
 
     // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
@@ -237,6 +669,8 @@ fn optimize_table_access(
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &access_methods_arena,
+        where_clause,
+        subqueries,
     )?
     else {
         return Ok(None);
@@ -246,8 +680,6 @@ fn optimize_table_access(
         best_plan,
         best_ordered_plan,
     } = best_join_order_result;
-
-    let joined_tables = table_references.joined_tables_mut();
 
     // See if best_ordered_plan is better than the overall best_plan if we add a sorting penalty
     // to the unordered plan's cost.
@@ -271,7 +703,7 @@ fn optimize_table_access(
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
             &access_methods_arena,
-            joined_tables,
+            table_references.joined_tables_mut(),
             &order_target,
         );
         if satisfies_order_target {
@@ -295,12 +727,34 @@ fn optimize_table_access(
         best_plan.table_numbers().collect::<Vec<_>>(),
     );
 
+    // Collect hash join build table indices. These tables should NOT be in the join_order
+    // because they are fully consumed during hash table building (similar to how ephemeral
+    // index source tables work). The build table's cursor is still opened and used, but
+    // it doesn't participate in the main loop iteration structure.
+    let hash_join_build_tables: Vec<usize> = best_access_methods
+        .iter()
+        .filter_map(|&am_idx| {
+            let arena = access_methods_arena.borrow();
+            arena.get(am_idx).and_then(|am| {
+                if let AccessMethodParams::HashJoin {
+                    build_table_idx, ..
+                } = &am.params
+                {
+                    Some(*build_table_idx)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
-        .into_iter()
-        .map(|table_number| JoinOrderMember {
-            table_id: joined_tables[table_number].internal_id,
+        .iter()
+        .filter(|table_number| !hash_join_build_tables.contains(table_number))
+        .map(|&table_number| JoinOrderMember {
+            table_id: table_references.joined_tables_mut()[table_number].internal_id,
             original_idx: table_number,
-            is_outer: joined_tables[table_number]
+            is_outer: table_references.joined_tables_mut()[table_number]
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.outer),
@@ -308,10 +762,10 @@ fn optimize_table_access(
         .collect();
 
     // Mutate the Operations in `joined_tables` to use the selected access methods.
-    for (i, join_order_member) in best_join_order.iter().enumerate() {
-        let table_idx = join_order_member.original_idx;
+    // We iterate over ALL tables (including hash join build tables) to set their operations,
+    // even though build tables are not in best_join_order.
+    for (i, &table_idx) in best_table_numbers.iter().enumerate() {
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
-
         match &access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir,
@@ -328,65 +782,116 @@ fn optimize_table_access(
                     };
 
                     if !try_to_build_ephemeral_index {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     }
                     // This branch means we have a full table scan for a non-outermost table.
                     // Try to construct an ephemeral index since it's going to be better than a scan.
+                    let table_id = table_references.joined_tables()[table_idx].internal_id;
                     let table_constraints = constraints_per_table
                         .iter()
-                        .find(|c| c.table_id == join_order_member.table_id);
+                        .find(|c| c.table_id == table_id);
                     let Some(table_constraints) = table_constraints else {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     };
-                    let usable_constraints = table_constraints
+                    // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
+                    // expression (table_col_pos == None) we cannot derive a seek key that matches
+                    // the row layout, so fall back to a scan in that situation.
+                    let usable: Vec<(usize, &Constraint)> = table_constraints
                         .constraints
                         .iter()
-                        .filter(|c| c.usable)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let mut temp_constraint_refs = (0..usable_constraints.len())
-                        .map(|i| ConstraintRef {
-                            constraint_vec_pos: i,
-                            index_col_pos: i,
-                            sort_order: SortOrder::Asc,
-                        })
-                        .collect::<Vec<_>>();
-                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+                        .enumerate()
+                        .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
+                        .collect();
+                    // Find this table's position in best_join_order (which excludes build tables)
+                    let join_order_pos = best_join_order
+                        .iter()
+                        .position(|m| m.original_idx == table_idx)
+                        .unwrap_or(best_join_order.len().saturating_sub(1));
 
+                    // Build a mapping from table_col_pos to index_col_pos.
+                    // Multiple constraints on the same column should share the same index_col_pos.
+                    //
+                    // This is important when a column appears in multiple constraints.
+                    // For example, in:
+                    //   SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c WHERE t2.a = 17
+                    //
+                    // The constraints on t2 are:
+                    //   t2.a = t1.a (from ON clause)
+                    //   t2.c = t1.c (from ON clause)
+                    //   t2.a = 17   (from WHERE clause)
+                    //
+                    // Both t2.a constraints must map to index_col_pos=0. If we incorrectly
+                    // assigned sequential index positions (0, 1, 2), the seek key would include
+                    // 3 components but the ephemeral index only has 2 key columns (t2.a, t2.c),
+                    // causing the seek to compare against the wrong columns and return no results.
+                    let mut unique_col_positions: Vec<usize> = usable
+                        .iter()
+                        .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
+                        .collect();
+                    unique_col_positions.sort_unstable();
+                    unique_col_positions.dedup();
+                    // Map each usable constraint to a ConstraintRef.
+                    // Multiple constraints with the same table_col_pos share the same index_col_pos.
+                    let mut temp_constraint_refs: Vec<ConstraintRef> = usable
+                        .iter()
+                        .map(|(orig_idx, c)| {
+                            let table_col_pos =
+                                c.table_col_pos.expect("table_col_pos was Some above");
+                            let index_col_pos = unique_col_positions
+                                .binary_search(&table_col_pos)
+                                .expect("table_col_pos must exist in unique_col_positions");
+                            ConstraintRef {
+                                constraint_vec_pos: *orig_idx, // index in the original constraints vec
+                                index_col_pos,
+                                sort_order: SortOrder::Asc,
+                            }
+                        })
+                        .collect();
+
+                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
                     let usable_constraint_refs = usable_constraints_for_join_order(
-                        &usable_constraints,
+                        &table_constraints.constraints,
                         &temp_constraint_refs,
-                        &best_join_order[..=i],
+                        &best_join_order[..=join_order_pos],
                     );
+
                     if usable_constraint_refs.is_empty() {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     }
-                    let ephemeral_index =
-                        ephemeral_index_build(&joined_tables[table_idx], &usable_constraint_refs);
+                    let ephemeral_index = ephemeral_index_build(
+                        &table_references.joined_tables_mut()[table_idx],
+                        &usable_constraint_refs,
+                    );
+
                     let ephemeral_index = Arc::new(ephemeral_index);
-                    joined_tables[table_idx].op = Operation::Search(Search::Seek {
-                        index: Some(ephemeral_index),
-                        seek_def: build_seek_def_from_constraints(
-                            &table_constraints.constraints,
-                            &usable_constraint_refs,
-                            *iter_dir,
-                            where_clause,
-                        )?,
-                    });
+                    table_references.joined_tables_mut()[table_idx].op =
+                        Operation::Search(Search::Seek {
+                            index: Some(ephemeral_index),
+                            seek_def: build_seek_def_from_constraints(
+                                &table_constraints.constraints,
+                                &usable_constraint_refs,
+                                *iter_dir,
+                                where_clause,
+                                Some(table_references),
+                            )?,
+                        });
                 } else {
-                    let is_outer_join = joined_tables[table_idx]
+                    let is_outer_join = table_references.joined_tables_mut()[table_idx]
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.outer);
@@ -416,38 +921,42 @@ fn optimize_table_access(
                         }
                     }
                     if let Some(index) = &index {
-                        joined_tables[table_idx].op = Operation::Search(Search::Seek {
-                            index: Some(index.clone()),
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints_per_table[table_idx].constraints,
-                                constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                            )?,
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Search(Search::Seek {
+                                index: Some(index.clone()),
+                                seek_def: build_seek_def_from_constraints(
+                                    &constraints_per_table[table_idx].constraints,
+                                    constraint_refs,
+                                    *iter_dir,
+                                    where_clause,
+                                    Some(table_references),
+                                )?,
+                            });
                         continue;
                     }
                     assert!(
                         constraint_refs.len() == 1,
                         "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
                     );
-                    joined_tables[table_idx].op = if let Some(eq) = constraint_refs[0].eq {
-                        Operation::Search(Search::RowidEq {
-                            cmp_expr: constraints_per_table[table_idx].constraints[eq]
-                                .get_constraining_expr(where_clause)
-                                .1,
-                        })
-                    } else {
-                        Operation::Search(Search::Seek {
-                            index: None,
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints_per_table[table_idx].constraints,
-                                constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                            )?,
-                        })
-                    };
+                    table_references.joined_tables_mut()[table_idx].op =
+                        if let Some(eq) = constraint_refs[0].eq {
+                            Operation::Search(Search::RowidEq {
+                                cmp_expr: constraints_per_table[table_idx].constraints[eq]
+                                    .get_constraining_expr(where_clause, Some(table_references))
+                                    .1,
+                            })
+                        } else {
+                            Operation::Search(Search::Seek {
+                                index: None,
+                                seek_def: build_seek_def_from_constraints(
+                                    &constraints_per_table[table_idx].constraints,
+                                    constraint_refs,
+                                    *iter_dir,
+                                    where_clause,
+                                    Some(table_references),
+                                )?,
+                            })
+                        };
                 }
             }
             AccessMethodParams::VirtualTable {
@@ -456,17 +965,38 @@ fn optimize_table_access(
                 constraints,
                 constraint_usages,
             } => {
-                joined_tables[table_idx].op = build_vtab_scan_op(
+                table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
                     idx_num,
                     idx_str,
                     constraints,
                     constraint_usages,
+                    Some(table_references),
                 )?;
             }
             AccessMethodParams::Subquery => {
-                joined_tables[table_idx].op = Operation::Scan(Scan::Subquery);
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Scan(Scan::Subquery);
+            }
+            AccessMethodParams::HashJoin {
+                build_table_idx,
+                probe_table_idx,
+                join_keys,
+                mem_budget,
+            } => {
+                // Mark WHERE clause terms as consumed since we're using hash join
+                for join_key in join_keys.iter() {
+                    where_clause[join_key.where_clause_idx].consumed = true;
+                }
+                // Set up hash join operation on the probe table
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::HashJoin(HashJoinOp {
+                        build_table_idx: *build_table_idx,
+                        probe_table_idx: *probe_table_idx,
+                        join_keys: join_keys.clone(),
+                        mem_budget: *mem_budget,
+                    });
             }
         }
     }
@@ -481,6 +1011,7 @@ fn build_vtab_scan_op(
     idx_str: &Option<String>,
     vtab_constraints: &[ConstraintInfo],
     constraint_usages: &[ConstraintUsage],
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<Operation> {
     if constraint_usages.len() != vtab_constraints.len() {
         return Err(LimboError::ExtensionError(format!(
@@ -518,7 +1049,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let (_, expr) = constraint.get_constraining_expr(where_clause);
+        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -616,6 +1147,7 @@ impl Optimizable for ast::Expr {
     /// by writing more complex code.
     fn is_nonnull(&self, tables: &TableReferences) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
@@ -654,10 +1186,12 @@ impl Optimizable for ast::Expr {
                     return true;
                 }
 
-                let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables
+                    .find_table_by_internal_id(*table)
+                    .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key || column.notnull
+                column.primary_key() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
@@ -690,9 +1224,10 @@ impl Optimizable for ast::Expr {
             Expr::Register(..) => false, // Register values can be null
         }
     }
-    /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
+    /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {
@@ -760,8 +1295,8 @@ impl Optimizable for ast::Expr {
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => false,
-            Expr::Register(_) => false, // Register values are not constants
+            Expr::Variable(_) => true,
+            Expr::Register(_) => false,
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -887,8 +1422,9 @@ fn ephemeral_index_build(
             name: c.name.clone().unwrap(),
             order: SortOrder::Asc,
             pos_in_table: i,
-            collation: c.collation,
+            collation: c.collation_opt(),
             default: c.default.clone(),
+            expr: None,
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
@@ -898,11 +1434,11 @@ fn ephemeral_index_build(
         let a_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == a.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(a.pos_in_table));
         let b_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == b.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(b.pos_in_table));
         match (a_constraint, b_constraint) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
@@ -926,6 +1462,7 @@ fn ephemeral_index_build(
             .table
             .btree()
             .is_some_and(|btree| btree.has_rowid),
+        index_method: None,
     };
 
     ephemeral_index
@@ -937,6 +1474,7 @@ pub fn build_seek_def_from_constraints(
     constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
     assert!(
         !constraint_refs.is_empty(),
@@ -945,7 +1483,7 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause))
+        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause, referenced_tables))
         .collect();
 
     let seek_def = build_seek_def(iter_dir, key)?;
@@ -996,10 +1534,12 @@ fn build_seek_def(
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: start_op,
+                affinity: Affinity::Blob,
             },
             end: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: end_op,
+                affinity: Affinity::Blob,
             },
         });
     }
@@ -1023,46 +1563,52 @@ fn build_seek_def(
                     let start = match last.lower_bound {
                         // Forwards, Asc, GT: (x=10 AND y>20)
                         // Start key: start from the first GT(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, GE: (x=10 AND y>=20)
                         // Start key: start from the first GE(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y<30)
                         // Start key: start from the first GE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.upper_bound {
                         // Forwards, Asc, LT, (x=10 AND y<30)
                         // End key: end at first GE(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, LE, (x=10 AND y<=30)
                         // End key: end at first GT(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y>20)
                         // End key: end at first GT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1072,46 +1618,52 @@ fn build_seek_def(
                     let start = match last.upper_bound {
                         // Forwards, Desc, LT: (x=10 AND y<30)
                         // Start key: start from the first GT(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Desc, LE: (x=10 AND y<=30)
                         // Start key: start from the first GE(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Desc, None: (x=10 AND y>20)
                         // Start key: start from the first GE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.lower_bound {
                         // Forwards, Asc, GT, (x=10 AND y>20)
                         // End key: end at first GE(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, GE, (x=10 AND y>=20)
                         // End key: end at first GT(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y<30)
                         // End key: end at first GT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1131,46 +1683,52 @@ fn build_seek_def(
                     let start = match last.upper_bound {
                         // Backwards, Asc, LT: (x=10 AND y<30)
                         // Start key: start from the first LT(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Asc, LT: (x=10 AND y<=30)
                         // Start key: start from the first LE(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Asc, None: (x=10 AND y>20)
                         // Start key: start from the first LE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op)
                         }
                     };
                     let end = match last.lower_bound {
                         // Backwards, Asc, GT, (x=10 AND y>20)
                         // End key: end at first LE(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Asc, GT, (x=10 AND y>=20)
                         // End key: end at first LT(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Asc, None, (x=10 AND y<30)
                         // End key: end at first LT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1180,46 +1738,52 @@ fn build_seek_def(
                     let start = match last.lower_bound {
                         // Backwards, Desc, LT: (x=10 AND y>20)
                         // Start key: start from the first LT(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Desc, LE: (x=10 AND y>=20)
                         // Start key: start from the first LE(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Desc, LE: (x=10 AND y<30)
                         // Start key: start from the first LE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.upper_bound {
                         // Backwards, Desc, LT, (x=10 AND y<30)
                         // End key: end at first LE(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Desc, LT, (x=10 AND y<=30)
                         // End key: end at first LT(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Desc, LT, (x=10 AND y>20)
                         // End key: end at first LT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };

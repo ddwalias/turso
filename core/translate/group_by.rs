@@ -321,6 +321,8 @@ fn collect_non_aggregate_expressions<'a>(
     Ok(())
 }
 
+/// Collects columns from different parts of a SELECT that are needed for
+/// GROUP BY.
 fn collect_result_columns<'a>(
     root_expr: &'a ast::Expr,
     plan: &SelectPlan,
@@ -336,6 +338,29 @@ fn collect_result_columns<'a>(
                 {
                     result_columns.push(expr);
                 }
+            }
+            // SubqueryResult is an exception because we can't "extract" columns from it
+            // unlike other expressions like function calls or direct column references,
+            // so we must add it so that the subquery result gets collected to the GROUP BY
+            // columns.
+            //
+            // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
+            // is done later.
+            ast::Expr::SubqueryResult { lhs, .. } => {
+                if let Some(ref lhs) = lhs {
+                    let mut lhs_contains_agg = false;
+                    walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                        if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                            lhs_contains_agg = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                        Ok(WalkControl::Continue)
+                    })?;
+                    if lhs_contains_agg {
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+                result_columns.push(expr);
             }
             _ => {
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
@@ -621,7 +646,10 @@ pub fn group_by_process_single_group(
             {
                 if *in_result {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.expr_to_reg_cache.push((expr, next_reg));
+                    t_ctx
+                        .resolver
+                        .expr_to_reg_cache
+                        .push((std::borrow::Cow::Borrowed(expr), next_reg));
                     next_reg += 1;
                 }
             }
@@ -644,7 +672,10 @@ pub fn group_by_process_single_group(
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.expr_to_reg_cache.push((expr, dest_reg));
+                t_ctx
+                    .resolver
+                    .expr_to_reg_cache
+                    .push((std::borrow::Cow::Borrowed(expr), dest_reg));
             }
         }
     }
@@ -767,10 +798,10 @@ pub fn group_by_emit_row_phase<'a>(
             register: agg_result_reg,
             func: agg.func.clone(),
         });
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((&agg.original_expr, agg_result_reg));
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(&agg.original_expr),
+            agg_result_reg,
+        ));
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();

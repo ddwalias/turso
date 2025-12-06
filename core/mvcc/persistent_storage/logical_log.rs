@@ -2,13 +2,14 @@
 #![allow(dead_code)]
 use crate::{
     io::ReadComplete,
-    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowVersion},
+    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
-    types::ImmutableRecord,
+    types::{ImmutableRecord, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
 };
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::File;
 
@@ -94,22 +95,21 @@ impl LogRecordType {
     }
 
     /// Serialize a row_version into on disk format.
-    /// Format of a "row" (maybe we could change the name because row is not general enough for
-    /// future type of values):
+    /// Format of a "row":
     ///
-    /// * table_id (root page) -> u64
-    /// * row type -> u8
+    /// * table_id (i64, 8 bytes) - always negative for MVCC table IDs
+    /// * row_kind (u8, 1 byte) - 0 = table row, 1 = index row
+    /// * record_type (u8, 1 byte) - 0 = DeleteRow, 1 = InsertRow
+    /// * payload_length (u64, 8 bytes)
     ///
-    /// (by row type)
-    /// Delete:
-    /// * Payload length -> u64
-    /// * Rowid -> varint
+    /// For table rows (row_kind = 0):
+    ///   * rowid (varint)
+    ///   * data_size (varint)
+    ///   * data (bytes)
     ///
-    /// Insert:
-    /// * Payload length -> u64
-    /// * Rowid -> varint
-    /// * Data size -> varint
-    /// * Data -> [u8] (data size length)
+    /// For index rows (row_kind = 1):
+    ///   * key_data_size (varint)
+    ///   * key_data (bytes) - the SortableIndexKey.key.as_blob()
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
         let table_id_i64: i64 = row_version.row.id.table_id.into();
         assert!(
@@ -117,22 +117,34 @@ impl LogRecordType {
             "table_id_i64 should be negative, but got {table_id_i64}"
         );
         buffer.extend_from_slice(&table_id_i64.to_be_bytes());
-        buffer.extend_from_slice(&self.as_u8().to_be_bytes());
-        let size_before_payload = buffer.len();
-        match self {
-            LogRecordType::DeleteRow => {
-                write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
-            }
-            LogRecordType::InsertRow => {
-                write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
 
-                let data = &row_version.row.data;
-                // Maybe this isn't needed? We already might infer data size with payload size
-                // anyways.
+        // Determine row kind: 0 = table row, 1 = index row
+        let row_kind = match &row_version.row.id.row_id {
+            RowKey::Int(_) => 0u8,
+            RowKey::Record(_) => 1u8,
+        };
+        buffer.push(row_kind);
+        buffer.push(self.as_u8());
+
+        let size_before_payload = buffer.len();
+
+        match &row_version.row.id.row_id {
+            RowKey::Int(rowid) => {
+                // Table row
+                write_varint_to_vec(*rowid as u64, buffer);
+                let data = row_version.row.payload();
                 write_varint_to_vec(data.len() as u64, buffer);
                 buffer.extend_from_slice(data);
             }
+            RowKey::Record(sortable_key) => {
+                // Index row - serialize just the ImmutableRecord bytes (the key data)
+                // The IndexInfo metadata will be reconstructed from schema during recovery
+                let key_bytes = sortable_key.key.as_blob();
+                write_varint_to_vec(key_bytes.len() as u64, buffer);
+                buffer.extend_from_slice(key_bytes);
+            }
         }
+
         // FIXME: remove shifting of bytes that we do by inserting payload sizes before everything
         // Should payload_size be varint?
         let payload_size = (buffer.len() - size_before_payload) as u64;
@@ -168,7 +180,7 @@ impl LogicalLog {
         buffer.extend_from_slice(&[0; 8]);
         let buffer_pos_for_rows_size = buffer.len();
 
-        // 3. Serialize rows
+        // 3. Serialize rows (both table and index rows)
         tx.row_versions.iter().for_each(|row_version| {
             let row_type = LogRecordType::from_row_version(row_version);
             row_type.serialize(&mut buffer, row_version);
@@ -241,9 +253,12 @@ impl LogicalLog {
     }
 }
 
+#[derive(Debug)]
 pub enum StreamingResult {
-    InsertRow { row: Row, rowid: RowID },
-    DeleteRow { rowid: RowID },
+    InsertTableRow { row: Row, rowid: RowID },
+    DeleteTableRow { row: Row, rowid: RowID },
+    InsertIndexRow { row: Row, rowid: RowID },
+    DeleteIndexRow { row: Row, rowid: RowID },
     Eof,
 }
 
@@ -272,7 +287,7 @@ pub struct StreamingLogicalLogReader {
 
 impl StreamingLogicalLogReader {
     pub fn new(file: Arc<dyn File>) -> Self {
-        let file_size = file.size().unwrap() as usize;
+        let file_size = file.size().expect("failed to get file size") as usize;
         Self {
             file,
             offset: 0,
@@ -289,7 +304,7 @@ impl StreamingLogicalLogReader {
         let header = Arc::new(RwLock::new(LogHeader::default()));
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let header = header.clone();
-            let mut header = header.write().unwrap();
+            let mut header = header.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
                 return;
@@ -304,7 +319,9 @@ impl StreamingLogicalLogReader {
             }
             let buf = buf.as_slice();
             header.version = buf[0];
-            header.salt = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+            header.salt = u64::from_be_bytes([
+                buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+            ]);
             header.encrypted = buf[10];
             tracing::trace!("LogicalLog header={:?}", header);
         });
@@ -317,7 +334,11 @@ impl StreamingLogicalLogReader {
     /// 1. Read start of transaction
     /// 2. Read next row
     /// 3. Check transaction marker
-    pub fn next_record(&mut self, io: &Arc<dyn crate::IO>) -> Result<StreamingResult> {
+    pub fn next_record(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
+    ) -> Result<StreamingResult> {
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
@@ -344,42 +365,124 @@ impl StreamingLogicalLogReader {
                         self.state = StreamingState::NeedTransactionStart;
                         continue;
                     }
-                    let table_id = MVTableId::from(self.consume_i64(io)?);
+                    let table_id_i64 = self.consume_i64(io)?;
+                    let table_id = MVTableId::from(table_id_i64);
+                    let row_kind = self.consume_u8(io)?;
                     let record_type = self.consume_u8(io)?;
                     let _payload_size = self.consume_u64(io)?;
-                    let mut bytes_read_on_row = 17; // table_id, record_type and payload_size
+                    let mut bytes_read_on_row = 18; // table_id, row_kind, record_type and payload_size
+
+                    let is_table_row = row_kind == 0;
+                    let is_index_row = row_kind == 1;
+
+                    if !is_table_row && !is_index_row {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid row_kind: {row_kind}, expected 0 (table) or 1 (index)"
+                        )));
+                    }
+
                     match LogRecordType::from_u8(record_type)
                         .unwrap_or_else(|| panic!("invalid record type: {record_type}"))
                     {
                         LogRecordType::DeleteRow => {
-                            let (rowid, n) = self.consume_varint(io)?;
-                            bytes_read_on_row += n;
-                            self.state = StreamingState::NeedRow {
-                                transaction_size,
-                                transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
-                            };
-                            return Ok(StreamingResult::DeleteRow {
-                                rowid: RowID::new(table_id, rowid as i64),
-                            });
+                            if is_table_row {
+                                let (rowid, nrowid) = self.consume_varint(io)?;
+                                let (payload_size, npayload) = self.consume_varint(io)?;
+                                let buffer = self.consume_buffer(io, payload_size as usize)?;
+                                let record = ImmutableRecord::from_bin_record(buffer.clone());
+                                let column_count = record.column_count();
+
+                                bytes_read_on_row += npayload + nrowid + payload_size as usize;
+                                self.state = StreamingState::NeedRow {
+                                    transaction_size,
+                                    transaction_read_bytes: transaction_read_bytes
+                                        + bytes_read_on_row,
+                                };
+                                let row = Row::new_table_row(
+                                    RowID::new(table_id, RowKey::Int(rowid as i64)),
+                                    buffer,
+                                    column_count,
+                                );
+                                return Ok(StreamingResult::DeleteTableRow {
+                                    rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
+                                    row,
+                                });
+                            } else {
+                                // Index row
+                                let (key_size, nkey) = self.consume_varint(io)?;
+                                let key_bytes = self.consume_buffer(io, key_size as usize)?;
+
+                                let key_record = ImmutableRecord::from_bin_record(key_bytes);
+                                let column_count = key_record.column_count();
+
+                                let index_info = get_index_info(table_id)?;
+                                let key = SortableIndexKey::new_from_record(key_record, index_info);
+
+                                bytes_read_on_row += nkey + key_size as usize;
+                                self.state = StreamingState::NeedRow {
+                                    transaction_size,
+                                    transaction_read_bytes: transaction_read_bytes
+                                        + bytes_read_on_row,
+                                };
+                                let row = Row::new_index_row(
+                                    RowID::new(table_id, RowKey::Record(key.clone())),
+                                    column_count,
+                                );
+                                return Ok(StreamingResult::DeleteIndexRow {
+                                    rowid: RowID::new(table_id, RowKey::Record(key)),
+                                    row,
+                                });
+                            }
                         }
                         LogRecordType::InsertRow => {
-                            let (rowid, nrowid) = self.consume_varint(io)?;
-                            let (payload_size, npayload) = self.consume_varint(io)?;
-                            let buffer = self.consume_buffer(io, payload_size as usize)?;
-                            let record = ImmutableRecord::from_bin_record(buffer.clone());
-                            let column_count = record.column_count();
+                            if is_table_row {
+                                let (rowid, nrowid) = self.consume_varint(io)?;
+                                let (payload_size, npayload) = self.consume_varint(io)?;
+                                let buffer = self.consume_buffer(io, payload_size as usize)?;
+                                let record = ImmutableRecord::from_bin_record(buffer.clone());
+                                let column_count = record.column_count();
 
-                            bytes_read_on_row += npayload + nrowid + payload_size as usize;
-                            self.state = StreamingState::NeedRow {
-                                transaction_size,
-                                transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
-                            };
-                            let row =
-                                Row::new(RowID::new(table_id, rowid as i64), buffer, column_count);
-                            return Ok(StreamingResult::InsertRow {
-                                rowid: RowID::new(table_id, rowid as i64),
-                                row,
-                            });
+                                bytes_read_on_row += npayload + nrowid + payload_size as usize;
+                                self.state = StreamingState::NeedRow {
+                                    transaction_size,
+                                    transaction_read_bytes: transaction_read_bytes
+                                        + bytes_read_on_row,
+                                };
+                                let row = Row::new_table_row(
+                                    RowID::new(table_id, RowKey::Int(rowid as i64)),
+                                    buffer,
+                                    column_count,
+                                );
+                                return Ok(StreamingResult::InsertTableRow {
+                                    rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
+                                    row,
+                                });
+                            } else {
+                                // Index row
+                                let (key_size, nkey) = self.consume_varint(io)?;
+                                let key_bytes = self.consume_buffer(io, key_size as usize)?;
+
+                                let key_record = ImmutableRecord::from_bin_record(key_bytes);
+                                let column_count = key_record.column_count();
+
+                                let index_info = get_index_info(table_id)?;
+                                let key = SortableIndexKey::new_from_record(key_record, index_info);
+
+                                bytes_read_on_row += nkey + key_size as usize;
+                                self.state = StreamingState::NeedRow {
+                                    transaction_size,
+                                    transaction_read_bytes: transaction_read_bytes
+                                        + bytes_read_on_row,
+                                };
+                                let row = Row::new_index_row(
+                                    RowID::new(table_id, RowKey::Record(key.clone())),
+                                    column_count,
+                                );
+                                return Ok(StreamingResult::InsertIndexRow {
+                                    rowid: RowID::new(table_id, RowKey::Record(key)),
+                                    row,
+                                });
+                            }
                         }
                     }
                 }
@@ -394,36 +497,50 @@ impl StreamingLogicalLogReader {
 
     fn consume_u8(&mut self, io: &Arc<dyn crate::IO>) -> Result<u8> {
         self.read_more_data(io, 1)?;
-        let r = self.buffer.read().unwrap()[self.buffer_offset];
+        let r = self.buffer.read()[self.buffer_offset];
         self.buffer_offset += 1;
         Ok(r)
     }
 
     fn consume_i64(&mut self, io: &Arc<dyn crate::IO>) -> Result<i64> {
         self.read_more_data(io, 8)?;
-        let r = i64::from_be_bytes(
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let buf = self.buffer.read();
+        let offset = self.buffer_offset;
+        let r = i64::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
         self.buffer_offset += 8;
         Ok(r)
     }
 
     fn consume_u64(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
         self.read_more_data(io, 8)?;
-        let r = u64::from_be_bytes(
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let buf = self.buffer.read();
+        let offset = self.buffer_offset;
+        let r = u64::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
         self.buffer_offset += 8;
         Ok(r)
     }
 
     fn consume_varint(&mut self, io: &Arc<dyn crate::IO>) -> Result<(u64, usize)> {
         self.read_more_data(io, 9)?;
-        let buffer_guard = self.buffer.read().unwrap();
+        let buffer_guard = self.buffer.read();
         let buffer = &buffer_guard[self.buffer_offset..];
         let (v, n) = read_varint(buffer)?;
         self.buffer_offset += n;
@@ -432,77 +549,116 @@ impl StreamingLogicalLogReader {
 
     fn consume_buffer(&mut self, io: &Arc<dyn crate::IO>, amount: usize) -> Result<Vec<u8>> {
         self.read_more_data(io, amount)?;
-        let buffer =
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + amount].to_vec();
+        let buffer = self.buffer.read()[self.buffer_offset..self.buffer_offset + amount].to_vec();
         self.buffer_offset += amount;
         Ok(buffer)
     }
 
-    fn get_buffer(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
-        self.buffer.read().unwrap()
+    fn get_buffer(&self) -> parking_lot::RwLockReadGuard<'_, Vec<u8>> {
+        self.buffer.read()
     }
 
+    /// Read at least `need` bytes from the logical log, issuing multiple reads if necessary.
+    /// If at any point 0 bytes are read, that indicates corruption.
     pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
         let bytes_can_read = self.bytes_can_read();
         if bytes_can_read >= need {
             return Ok(());
         }
-        let to_read = 4096.max(need);
-        let to_read = to_read.min(self.file_size - self.offset);
-        let header_buf = Arc::new(Buffer::new_temporary(to_read));
-        let buffer = self.buffer.clone();
-        let completion: Box<ReadComplete> = Box::new(move |res| {
-            let buffer = buffer.clone();
-            let mut buffer = buffer.write().unwrap();
-            let Ok((buf, bytes_read)) = res else {
-                tracing::trace!("couldn't ready log err={:?}", res,);
-                return;
-            };
+
+        let initial_buffer_offset = self.buffer_offset;
+
+        loop {
+            let buffer_size_before_read = self.buffer.read().len();
             turso_assert!(
-                bytes_read as usize >= need,
-                "couldn't read enough data. Requested={need} got={bytes_read}"
+                buffer_size_before_read >= self.buffer_offset,
+                "buffer_size_before_read={buffer_size_before_read} < buffer_offset={}",
+                self.buffer_offset
             );
-            let buf = buf.as_slice();
-            buffer.extend_from_slice(buf);
-        });
-        let c = Completion::new_read(header_buf, completion);
-        let c = self.file.pread(self.offset as u64, c)?;
-        io.wait_for_completion(c)?;
-        self.offset += to_read;
+            let bytes_available_in_buffer = buffer_size_before_read - self.buffer_offset;
+            let still_need = need.saturating_sub(bytes_available_in_buffer);
+
+            if still_need == 0 {
+                break;
+            }
+
+            turso_assert!(
+                self.file_size >= self.offset,
+                "file_size={} < offset={}",
+                self.file_size,
+                self.offset
+            );
+            let to_read = 4096.max(still_need).min(self.file_size - self.offset);
+
+            if to_read == 0 {
+                // No more data available in file even though we need more -> corrupt
+                return Err(LimboError::Corrupt(format!(
+                    "Expected to read {still_need} bytes more but reached end of file at offset {}",
+                    self.offset
+                )));
+            }
+
+            let header_buf = Arc::new(Buffer::new_temporary(to_read));
+            let buffer = self.buffer.clone();
+            let completion: Box<ReadComplete> = Box::new(move |res| {
+                let buffer = buffer.clone();
+                let mut buffer = buffer.write();
+                let Ok((buf, bytes_read)) = res else {
+                    panic!("Logical log read failed: {res:?}");
+                };
+                let buf = buf.as_slice();
+                if bytes_read > 0 {
+                    buffer.extend_from_slice(&buf[..bytes_read as usize]);
+                }
+            });
+            let c = Completion::new_read(header_buf, completion);
+            let c = self.file.pread(self.offset as u64, c)?;
+            io.wait_for_completion(c)?;
+
+            let buffer_size_after_read = self.buffer.read().len();
+            let bytes_read = buffer_size_after_read - buffer_size_before_read;
+
+            if bytes_read == 0 {
+                return Err(LimboError::Corrupt(format!(
+                    "Expected to read {still_need} bytes more but read 0 bytes at offset {}",
+                    self.offset
+                )));
+            }
+
+            self.offset += bytes_read;
+        }
+
         // cleanup consumed bytes
         // this could be better for sure
-        let _ = self.buffer.write().unwrap().drain(0..self.buffer_offset);
+        let _ = self.buffer.write().drain(0..initial_buffer_offset);
         self.buffer_offset = 0;
         Ok(())
     }
 
     fn bytes_can_read(&self) -> usize {
-        self.buffer.read().unwrap().len() - self.buffer_offset
+        self.buffer.read().len() - self.buffer_offset
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::collections::BTreeSet;
 
-    use rand::{thread_rng, Rng};
+    use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
 
     use crate::{
-        mvcc::{
-            database::{
-                tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-                Row, RowID,
-            },
-            persistent_storage::Storage,
-            LocalClock, MvStore,
+        mvcc::database::{
+            tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
+            Row, RowID, RowKey, SortableIndexKey,
         },
-        types::{ImmutableRecord, Text},
-        OpenFlags, Value, ValueRef,
+        types::{ImmutableRecord, IndexInfo, Text},
+        Value, ValueRef,
     };
+    use std::sync::Arc;
 
     use super::LogRecordType;
 
@@ -510,10 +666,10 @@ mod tests {
     fn test_logical_log_read() {
         // Load a transaction
         // let's not drop db as we don't want files to be removed
-        let db = MvccTestDbNoConn::new_with_random_db();
-        let (io, pager) = {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
             // insert table id -2 into sqlite_schema table (table_id -1)
@@ -532,55 +688,55 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: 1,
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             // now insert a row into table -2
             let row = generate_simple_string_row((-2).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            conn.close().unwrap();
-            let db = db.get_db();
-            (db.io.clone(), pager)
-        };
+        }
 
-        // Now try to read it back
-        let log_file = db.get_log_path();
+        // Restart the database to trigger recovery
+        db.restart();
 
-        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
-        let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
+        // Now try to read it back - recovery happens automatically during bootstrap
+        let conn = db.connect();
+        let pager = conn.pager.load().clone();
+        let mvcc_store = db.get_mvcc_store();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         let row = mvcc_store
-            .read(tx, RowID::new((-2).into(), 1))
+            .read(tx, RowID::new((-2).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
-        let record = ImmutableRecord::from_bin_record(row.data.clone());
+        let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
         let values = record.get_values();
         let foo = values.first().unwrap();
-        let ValueRef::Text(foo, _) = foo else {
+        let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
-        assert_eq!(foo, b"foo");
+        assert_eq!(foo.as_str(), "foo");
     }
 
     #[test]
     fn test_logical_log_read_multiple_transactions() {
         let values = (0..100)
-            .map(|i| (RowID::new((-2).into(), i), format!("foo_{i}")))
+            .map(|i| {
+                (
+                    RowID::new((-2).into(), RowKey::Int(i as i64)),
+                    format!("foo_{i}"),
+                )
+            })
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
-        let db = MvccTestDbNoConn::new_with_random_db();
-        let (io, pager) = {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
 
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
@@ -600,14 +756,11 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: 1,
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -615,43 +768,44 @@ mod tests {
             // generate insert per transaction
             for (rowid, value) in &values {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                let row = generate_simple_string_row(rowid.table_id, rowid.row_id, value);
+                let row = generate_simple_string_row(
+                    rowid.table_id,
+                    rowid.row_id.to_int_or_panic(),
+                    value,
+                );
                 mvcc_store.insert(tx_id, row).unwrap();
                 commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             }
+        }
 
-            conn.close().unwrap();
-            let db = db.get_db();
-            (db.io.clone(), pager)
-        };
+        // Restart the database to trigger recovery
+        db.restart();
 
-        // Now try to read it back
-        let log_file = db.get_log_path();
-
-        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
-        let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
+        // Now try to read it back - recovery happens automatically during bootstrap
+        let conn = db.connect();
+        let pager = conn.pager.load().clone();
+        let mvcc_store = db.get_mvcc_store();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, *rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let ValueRef::Text(foo, _) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
-            assert_eq!(*foo, value.as_bytes());
+            assert_eq!(foo.as_str(), value.as_str());
         }
     }
 
     #[test]
     fn test_logical_log_read_fuzz() {
-        let seed = thread_rng().gen();
+        let seed = rng().random();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
-        let mut present_rowids = HashSet::new();
-        let mut non_present_rowids = HashSet::new();
+        let mut present_rowids = BTreeSet::new();
+        let mut non_present_rowids = BTreeSet::new();
         for _ in 0..num_transactions {
             let num_operations = rng.next_u64() % 8;
             let mut ops = vec![];
@@ -659,15 +813,16 @@ mod tests {
                 let op_type = rng.next_u64() % 2;
                 match op_type {
                     0 => {
-                        let row_id = rng.next_u64();
-                        let rowid = RowID::new((-2).into(), row_id as i64);
+                        // Generate a positive rowid that fits in i64
+                        let row_id = (rng.next_u64() % (i64::MAX as u64)) as i64;
+                        let rowid = RowID::new((-2).into(), RowKey::Int(row_id));
                         let row = generate_simple_string_row(
                             rowid.table_id,
-                            rowid.row_id,
+                            rowid.row_id.to_int_or_panic(),
                             &format!("row_{row_id}"),
                         );
-                        ops.push((LogRecordType::InsertRow, Some(row), rowid));
-                        present_rowids.insert(rowid);
+                        ops.push((LogRecordType::InsertRow, Some(row), rowid.clone()));
+                        present_rowids.insert(rowid.clone());
                         non_present_rowids.remove(&rowid);
                         tracing::debug!("insert {rowid:?}");
                     }
@@ -676,10 +831,10 @@ mod tests {
                             continue;
                         }
                         let row_id_pos = rng.next_u64() as usize % present_rowids.len();
-                        let row_id = *present_rowids.iter().nth(row_id_pos).unwrap();
-                        ops.push((LogRecordType::DeleteRow, None, row_id));
+                        let row_id = present_rowids.iter().nth(row_id_pos).unwrap().clone();
+                        ops.push((LogRecordType::DeleteRow, None, row_id.clone()));
                         present_rowids.remove(&row_id);
-                        non_present_rowids.insert(row_id);
+                        non_present_rowids.insert(row_id.clone());
                         tracing::debug!("removed {row_id:?}");
                     }
                     _ => unreachable!(),
@@ -691,7 +846,7 @@ mod tests {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         let pager = {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
 
             // insert table id -2 into sqlite_schema table (table_id -1)
@@ -711,14 +866,11 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: 1,
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -729,7 +881,7 @@ mod tests {
                 for (op_type, maybe_row, rowid) in ops {
                     match op_type {
                         LogRecordType::DeleteRow => {
-                            mvcc_store.delete(tx_id, *rowid).unwrap();
+                            mvcc_store.delete(tx_id, rowid.clone()).unwrap();
                         }
                         LogRecordType::InsertRow => {
                             mvcc_store
@@ -754,28 +906,136 @@ mod tests {
         // Check rowids that weren't deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, present_rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let ValueRef::Text(foo, _) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
 
             assert_eq!(
-                String::from_utf8_lossy(foo),
-                format!("row_{}", present_rowid.row_id as u64)
+                foo.as_str(),
+                format!("row_{}", present_rowid.row_id.to_int_or_panic())
             );
         }
 
         // Check rowids that were deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, present_rowid).unwrap();
+            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap();
             assert!(
                 row.is_none(),
                 "row {present_rowid:?} should have been removed"
             );
+        }
+    }
+
+    #[test]
+    fn test_logical_log_read_table_and_index_rows() {
+        // Test that both table rows and index rows can be read back after recovery
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+
+            // Create a table with an index
+            conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_data ON test(data)").unwrap();
+
+            // Checkpoint to ensure the index has a root_page mapping
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+            // Insert some data - this will create both table rows and index rows in the logical log
+            // Don't checkpoint after inserts so they remain in the logical log for recovery testing
+            conn.execute("INSERT INTO test(id, data) VALUES (1, 'foo')")
+                .unwrap();
+            conn.execute("INSERT INTO test(id, data) VALUES (2, 'bar')")
+                .unwrap();
+            conn.execute("INSERT INTO test(id, data) VALUES (3, 'baz')")
+                .unwrap();
+        }
+
+        // Restart the database to trigger recovery
+        db.restart();
+
+        // Now verify that both table rows and index rows can be read back
+        let conn = db.connect();
+        let pager = conn.pager.load().clone();
+        let mvcc_store = db.get_mvcc_store();
+        let schema = conn.schema.read();
+
+        // Get the index from schema
+        let index = schema
+            .get_index("test", "idx_data")
+            .expect("Index should exist");
+        // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
+        let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
+        let index_info = Arc::new(IndexInfo::new_from_index(index));
+
+        // Verify table rows can be read
+        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
+            let row = mvcc_store
+                .read(tx, RowID::new((-2).into(), RowKey::Int(row_id)))
+                .unwrap()
+                .expect("Table row should exist");
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let values = record.get_values();
+            let data_value = values.get(1).expect("Should have data column");
+            let ValueRef::Text(data_text) = data_value else {
+                panic!("Data column should be text");
+            };
+            assert_eq!(data_text.as_str(), expected_data);
+        }
+
+        // Verify index rows can be read
+        // Note: Index rows are written to the logical log, but we need to construct the correct key format
+        // The index key format is (indexed_column_value, table_rowid)
+        for (row_id, data_value) in [(1, "foo"), (2, "bar"), (3, "baz")] {
+            // Create the index key: (data_value, rowid)
+            // The index on data column stores (data_value, table_rowid) as the key
+            let key_record = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new(data_value.to_string())),
+                    Value::Integer(row_id),
+                ],
+                2,
+            );
+            let sortable_key = SortableIndexKey::new_from_record(key_record, index_info.clone());
+            let index_rowid = RowID::new(index_id, RowKey::Record(sortable_key));
+
+            // Use read_from_table_or_index to read the index row
+            // This verifies that index rows were properly serialized and deserialized from the logical log
+            let index_row_opt = mvcc_store
+                .read_from_table_or_index(tx, index_rowid.clone(), Some(index_id))
+                .unwrap_or_else(|e| {
+                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}", 
+                           data_value, row_id, e, index_id, index.root_page)
+                });
+
+            let Some(index_row) = index_row_opt else {
+                panic!("Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log.");
+            };
+            // Verify the index row contains the correct data
+            let RowKey::Record(sortable_key) = index_row.id.row_id else {
+                panic!("Index row should have a record row_id");
+            };
+            let record = sortable_key.key.clone();
+            let values = record.get_values();
+            assert_eq!(
+                values.len(),
+                2,
+                "Index row should have 2 columns (data, rowid)"
+            );
+            let ValueRef::Text(index_data) = values[0] else {
+                panic!("First index column should be text");
+            };
+            assert_eq!(index_data.as_str(), data_value, "Index data should match");
+            let ValueRef::Integer(index_rowid_val) = values[1] else {
+                panic!("Second index column should be integer (rowid)");
+            };
+            assert_eq!(index_rowid_val, row_id, "Index rowid should match");
         }
     }
 }

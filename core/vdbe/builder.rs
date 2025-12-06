@@ -1,19 +1,21 @@
+use parking_lot::RwLock;
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     sync::{atomic::AtomicI64, Arc},
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast::{self, ResolveType, TableInternalId};
 
 use crate::{
+    index_method::IndexMethodAttachment,
     numeric::Numeric,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
-        expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
     CaptureDataChangesMode, Connection, Value, VirtualTable,
@@ -38,7 +40,7 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
+use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -54,6 +56,8 @@ pub struct CursorKey {
     /// The index, in case of an index cursor.
     /// The combination of table internal id and index is enough to disambiguate.
     pub index: Option<Arc<Index>>,
+    /// Whether this cursor is an special case build cursor.
+    pub is_build: bool,
 }
 
 impl CursorKey {
@@ -61,6 +65,7 @@ impl CursorKey {
         Self {
             table_reference_id,
             index: None,
+            is_build: false,
         }
     }
 
@@ -68,11 +73,25 @@ impl CursorKey {
         Self {
             table_reference_id,
             index: Some(index),
+            is_build: false,
+        }
+    }
+
+    /// Create a cursor key for hash join build operations.
+    /// This creates a separate cursor from the regular table cursor.
+    pub fn hash_build(table_reference_id: TableInternalId) -> Self {
+        Self {
+            table_reference_id,
+            index: None,
+            is_build: true,
         }
     }
 
     pub fn equals(&self, other: &CursorKey) -> bool {
         if self.table_reference_id != other.table_reference_id {
+            return false;
+        }
+        if self.is_build != other.is_build {
             return false;
         }
         match (self.index.as_ref(), other.index.as_ref()) {
@@ -89,7 +108,7 @@ pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
-    insns: Vec<(Insn, usize)>,
+    pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -122,20 +141,30 @@ pub struct ProgramBuilder {
     query_mode: QueryMode,
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
-    pub param_ctx: ParamState,
     pub(crate) reg_result_cols_start: Option<usize>,
+    /// Whether the program needs to use statement subtransactions,
+    /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
+    /// instead of the entire transaction.
+    needs_stmt_subtransactions: bool,
+    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
+    pub trigger: Option<Arc<Trigger>>,
+    pub resolve_type: ResolveType,
+    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
+    /// This allows for things like hash build to use a separate cursor for iterating the same table.
+    cursor_overrides: HashMap<usize, CursorID>,
 }
 
 #[derive(Debug, Clone)]
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
+    IndexMethod(Arc<dyn IndexMethodAttachment>),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
     MaterializedView(
         Arc<BTreeTable>,
-        Arc<std::sync::Mutex<crate::incremental::view::IncrementalView>>,
+        Arc<parking_lot::Mutex<crate::incremental::view::IncrementalView>>,
     ),
 }
 
@@ -186,6 +215,22 @@ impl ProgramBuilder {
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
     ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None)
+    }
+    pub fn new_for_trigger(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+        trigger: Arc<Trigger>,
+    ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger))
+    }
+    fn _new(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+        trigger: Option<Arc<Trigger>>,
+    ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
@@ -209,9 +254,20 @@ impl ProgramBuilder {
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
-            param_ctx: ParamState::default(),
             reg_result_cols_start: None,
+            needs_stmt_subtransactions: false,
+            trigger,
+            resolve_type: ResolveType::Abort,
+            cursor_overrides: HashMap::new(),
         }
+    }
+
+    pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
+        self.resolve_type = resolve_type;
+    }
+
+    pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
+        self.needs_stmt_subtransactions = needs_stmt_subtransactions;
     }
 
     pub fn capture_data_changes_mode(&self) -> &CaptureDataChangesMode {
@@ -309,6 +365,34 @@ impl ProgramBuilder {
             "duplicate cursor key"
         );
         self._alloc_cursor_id(Some(key), cursor_type)
+    }
+
+    pub fn alloc_cursor_id_keyed_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        cursor_type: CursorType,
+    ) -> usize {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            cursor_id
+        } else {
+            self._alloc_cursor_id(Some(key), cursor_type)
+        }
+    }
+
+    /// allocate proper cursor for the given index (either [CursorType::BTreeIndex] or [CursorType::IndexMethod])
+    pub fn alloc_cursor_index(
+        &mut self,
+        key: Option<CursorKey>,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        tracing::debug!("alloc cursor: {:?} {:?}", key, index.index_method.is_some());
+        let module = index.index_method.as_ref();
+        if let Some(m) = module {
+            if !m.definition().backing_btree {
+                return Ok(self._alloc_cursor_id(key, CursorType::IndexMethod(m.clone())));
+            }
+        }
+        Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
@@ -483,11 +567,11 @@ impl ProgramBuilder {
         });
         for resolved_offset in self.label_to_resolved_offset.iter_mut() {
             if let Some((old_offset, target)) = resolved_offset {
-                let new_offset = self
-                    .insns
-                    .iter()
-                    .position(|(_, index)| *old_offset == *index as u32)
-                    .unwrap() as u32;
+                let new_offset =
+                    self.insns
+                        .iter()
+                        .position(|(_, index)| *old_offset == *index as u32)
+                        .expect("instruction offset must exist") as u32;
                 *resolved_offset = Some((new_offset, *target));
             }
         }
@@ -758,59 +842,66 @@ impl ProgramBuilder {
                     resolve(target_pc_lt, "Jump");
                     resolve(target_pc_gt, "Jump");
                 }
-                Insn::SeekGE { target_pc, .. } => {
-                    resolve(target_pc, "SeekGE");
+                Insn::SeekGE { target_pc, .. } => resolve(target_pc, "SeekGE"),
+                Insn::SeekGT { target_pc, .. } => resolve(target_pc, "SeekGT"),
+                Insn::SeekLE { target_pc, .. } => resolve(target_pc, "SeekLE"),
+                Insn::SeekLT { target_pc, .. } => resolve(target_pc, "SeekLT"),
+                Insn::IdxGE { target_pc, .. } => resolve(target_pc, "IdxGE"),
+                Insn::IdxLE { target_pc, .. } => resolve(target_pc, "IdxLE"),
+                Insn::IdxGT { target_pc, .. } => resolve(target_pc, "IdxGT"),
+                Insn::IdxLT { target_pc, .. } => resolve(target_pc, "IdxLT"),
+                Insn::IndexMethodQuery { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "IndexMethodQuery")
                 }
-                Insn::SeekGT { target_pc, .. } => {
-                    resolve(target_pc, "SeekGT");
-                }
-                Insn::SeekLE { target_pc, .. } => {
-                    resolve(target_pc, "SeekLE");
-                }
-                Insn::SeekLT { target_pc, .. } => {
-                    resolve(target_pc, "SeekLT");
-                }
-                Insn::IdxGE { target_pc, .. } => {
-                    resolve(target_pc, "IdxGE");
-                }
-                Insn::IdxLE { target_pc, .. } => {
-                    resolve(target_pc, "IdxLE");
-                }
-                Insn::IdxGT { target_pc, .. } => {
-                    resolve(target_pc, "IdxGT");
-                }
-                Insn::IdxLT { target_pc, .. } => {
-                    resolve(target_pc, "IdxLT");
-                }
-                Insn::IsNull { reg: _, target_pc } => {
-                    resolve(target_pc, "IsNull");
-                }
-                Insn::VNext { pc_if_next, .. } => {
-                    resolve(pc_if_next, "VNext");
-                }
-                Insn::VFilter { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "VFilter");
-                }
-                Insn::NoConflict { target_pc, .. } => {
-                    resolve(target_pc, "NoConflict");
-                }
-                Insn::Found { target_pc, .. } => {
-                    resolve(target_pc, "Found");
-                }
-                Insn::NotFound { target_pc, .. } => {
-                    resolve(target_pc, "NotFound");
-                }
-                Insn::FkIfZero { target_pc, .. } => {
-                    resolve(target_pc, "FkIfZero");
-                }
+                Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull"),
+                Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext"),
+                Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter"),
+                Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead"),
+                Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict"),
+                Insn::Found { target_pc, .. } => resolve(target_pc, "Found"),
+                Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound"),
+                Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero"),
+                Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter"),
+                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe"),
+                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext"),
                 _ => {}
             }
         }
         self.label_to_resolved_offset.clear();
     }
 
+    /// Set a cursor override for a table. When resolving a table cursor for this table,
+    /// the override cursor will be used instead of the normal resolution.
+    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
+        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    }
+
+    /// Clear the cursor override for a table.
+    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
+        self.cursor_overrides.remove(&table_ref_id.into());
+    }
+
+    /// Clear all cursor overrides.
+    pub fn clear_all_cursor_overrides(&mut self) {
+        self.cursor_overrides.clear();
+    }
+
+    /// Check if a cursor override is active for a given table.
+    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
+        self.cursor_overrides.contains_key(&table_ref_id.into())
+    }
+
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
+        // Check cursor overrides first, only apply override for table cursors.
+        // Index cursor lookups are not overridden because when a cursor override is active,
+        // the calling code (translate_expr) should skip index logic entirely.
+        if key.index.is_none() && !key.is_build {
+            let table_id: usize = key.table_reference_id.into();
+            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
+                return Some(cursor_id);
+            }
+        }
         self.cursor_ref
             .iter()
             .position(|(k, _)| k.as_ref().is_some_and(|k| k.equals(key)))
@@ -819,6 +910,42 @@ impl ProgramBuilder {
     pub fn resolve_cursor_id(&self, key: &CursorKey) -> CursorID {
         self.resolve_cursor_id_safe(key)
             .unwrap_or_else(|| panic!("Cursor not found: {key:?}"))
+    }
+
+    /// Resolve the first allocated index cursor for a given table reference.
+    /// This method exists due to a limitation of our translation system where
+    /// a subquery that references an outer query table cannot know whether a
+    /// table cursor, index cursor, or both were opened for that table reference.
+    /// Hence: currently we first try to resolve a table cursor, and if that fails,
+    /// we resolve an index cursor via this method.
+    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
+        self.cursor_ref
+            .iter()
+            .position(|(k, _)| {
+                k.as_ref()
+                    .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+            })
+            .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
+    }
+
+    /// Resolve the [Index] that a given cursor is associated with.
+    pub fn resolve_index_for_cursor_id(&self, cursor_id: CursorID) -> Arc<Index> {
+        let cursor_ref = &self
+            .cursor_ref
+            .get(cursor_id)
+            .unwrap_or_else(|| panic!("Cursor not found: {cursor_id}"))
+            .1;
+        let CursorType::BTreeIndex(index) = cursor_ref else {
+            panic!("Cursor is not an index: {cursor_id}");
+        };
+        index.clone()
+    }
+
+    /// Get the [CursorType] of a given cursor.
+    pub fn get_cursor_type(&self, cursor_id: CursorID) -> Option<&CursorType> {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type)
     }
 
     pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
@@ -849,6 +976,15 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
+        if self.trigger.is_some() {
+            self.init_label = self.allocate_label();
+            self.emit_insn(Insn::Init {
+                target_pc: self.init_label,
+            });
+            self.preassign_label_to_next_insn(self.init_label);
+            self.start_offset = self.offset();
+            return;
+        }
         if self.nested_level == 0 {
             self.init_label = self.allocate_label();
 
@@ -887,6 +1023,13 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
+        if self.trigger.is_some() {
+            self.emit_insn(Insn::Halt {
+                err_code: 0,
+                description: "trigger".to_string(),
+            });
+            return;
+        }
         if self.nested_level == 0 {
             // "rollback" flag is used to determine if halt should rollback the transaction.
             self.emit_halt(self.rollback);
@@ -945,13 +1088,13 @@ impl ProgramBuilder {
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
-        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
         if let CursorType::BTreeTable(btree) = cursor_type {
             let column_def = btree
                 .columns
                 .get(column)
                 .expect("column index out of bounds");
-            if column_def.is_rowid_alias {
+            if column_def.is_rowid_alias() {
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,
@@ -965,7 +1108,7 @@ impl ProgramBuilder {
     }
 
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
-        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
         use crate::translate::expr::sanitize_string;
 
@@ -995,9 +1138,10 @@ impl ProgramBuilder {
                         .chunks_exact(2)
                         .map(|pair| {
                             // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
+                            // the input is valid hex string, thus expect is safe.
+                            let hex_byte =
+                                std::str::from_utf8(pair).expect("parser validated hex string");
+                            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                         })
                         .collect(),
                 ),
@@ -1017,6 +1161,11 @@ impl ProgramBuilder {
         self.resolve_labels();
 
         self.parameters.list.dedup();
+
+        if !self.table_references.is_empty() && matches!(self.txn_mode, TransactionMode::Write) {
+            self.needs_stmt_subtransactions = true;
+        }
+
         Program {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -1030,6 +1179,10 @@ impl ProgramBuilder {
             table_references: self.table_references,
             sql: sql.to_string(),
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
+            needs_stmt_subtransactions: self.needs_stmt_subtransactions,
+            trigger: self.trigger.take(),
+            resolve_type: self.resolve_type,
+            explain_state: RwLock::new(ExplainState::default()),
         }
     }
 }

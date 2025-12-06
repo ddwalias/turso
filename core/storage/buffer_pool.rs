@@ -26,6 +26,10 @@ pub struct ArenaBuffer {
     len: usize,
 }
 
+// Unsound: write and read from different threads can be dangerous with current ArenaBuffer implementation without some additional explicit synchronization
+unsafe impl Sync for ArenaBuffer {}
+unsafe impl Send for ArenaBuffer {}
+
 impl ArenaBuffer {
     const fn new(
         arena: Weak<Arena>,
@@ -239,13 +243,13 @@ impl PoolInner {
                 .wal_frame_arena
                 .as_ref()
                 .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-                .unwrap_or(Buffer::new_temporary(len));
+                .unwrap_or_else(|| Buffer::new_temporary(len));
         }
         // For all other sizes, use regular arena
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, len))
-            .unwrap_or(Buffer::new_temporary(len))
+            .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
     fn get_db_page_buffer(&mut self) -> Buffer {
@@ -253,7 +257,7 @@ impl PoolInner {
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
-            .unwrap_or(Buffer::new_temporary(db_page_size))
+            .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
     }
 
     fn get_wal_frame_buffer(&mut self) -> Buffer {
@@ -261,7 +265,7 @@ impl PoolInner {
         self.wal_frame_arena
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-            .unwrap_or(Buffer::new_temporary(len))
+            .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
     /// Allocate a new arena for the pool to use

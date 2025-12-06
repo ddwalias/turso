@@ -60,7 +60,7 @@ pub fn translate_pragma(
     let (mut program, mode) = match body {
         None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => query_pragma(
+            PragmaName::TableInfo | PragmaName::TableXinfo => query_pragma(
                 pragma,
                 resolver.schema,
                 Some(*value),
@@ -231,6 +231,12 @@ fn update_pragma(
             // getting here
             unreachable!();
         }
+        PragmaName::TableXinfo => {
+            // because we need control over the write parameter for the transaction,
+            // this should be unreachable. We have to force-call query_pragma before
+            // getting here
+            unreachable!();
+        }
         PragmaName::PageSize => {
             let page_size = match parse_signed_number(&value)? {
                 Value::Integer(size) => size,
@@ -241,6 +247,26 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
+            // Check if autovacuum is enabled in database opts
+            if !connection.db.opts.enable_autovacuum {
+                return Err(LimboError::InvalidArgument(
+                    "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
+                        .to_string(),
+                ));
+            }
+
+            let is_empty = is_database_empty(resolver.schema, &pager)?;
+            tracing::debug!(
+                "Checking if database is empty for auto_vacuum pragma: {}",
+                is_empty
+            );
+
+            if !is_empty {
+                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
+                tracing::debug!("Attempted to set auto_vacuum, database is not empty so we are ignoring pragma.");
+                return Ok((program, TransactionMode::None));
+            }
+
             let auto_vacuum_mode = match value {
                 Expr::Name(name) => {
                     let name = name.as_str().as_bytes();
@@ -528,19 +554,54 @@ fn query_pragma(
             };
 
             let base_reg = register;
+            // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(&mut program, table.columns(), base_reg);
+                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, false);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
-                    let view = view_mutex.lock().unwrap();
+                    let view = view_mutex.lock();
                     let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg);
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, false);
                 } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, false);
                 }
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+            for name in col_names {
+                program.add_pragma_result_column(name.into());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TableXinfo => {
+            let name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
+            program.alloc_registers(6);
+            if let Some(name) = name {
+                if let Some(table) = schema.get_table(&name) {
+                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, true);
+                } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
+                    let view = view_mutex.lock();
+                    let flat_columns = view.column_schema.flat_columns();
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, true);
+                } else if let Some(view) = schema.get_view(&name) {
+                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, true);
+                }
+            }
+            let col_names = [
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ];
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
@@ -719,13 +780,38 @@ fn emit_columns_for_table_info(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
     base_reg: usize,
+    extended: bool,
 ) {
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
-    // Therefore, we enumerate only after filtering out hidden columns.
-    for (i, column) in columns.iter().filter(|col| !col.hidden).enumerate() {
+    // Therefore, we enumerate only after filtering out hidden columns (if extended set to false).
+    let mut cid = 0;
+    for column in columns.iter() {
+        // Determine column type which will be used for filtering in table_info pragma or as "hidden" column for table_xinfo pragma.
+        //
+        // SQLite docs about table_xinfo:
+        // > The output has the same columns as for PRAGMA table_info plus a column, "hidden",
+        // > whose value signifies a normal column (0), a dynamic or stored generated column (2 or 3),
+        // > or a hidden column in a virtual table (1). The rows for which this field is non-zero are those omitted for PRAGMA table_info.
+        //
+        // (see https://sqlite.org/pragma.html#pragma_table_xinfo)
+        let column_type = if column.hidden() {
+            // hidden column
+            1
+        } else {
+            // normal column
+            0
+        };
+
+        if !extended && column_type != 0 {
+            // This pragma (table_info) does not show information about generated columns or hidden columns.
+            continue;
+        }
+
         // cid
-        program.emit_int(i as i64, base_reg);
+        program.emit_int(cid as i64, base_reg);
+        cid += 1;
+
         // name
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
@@ -733,7 +819,7 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
 
         // notnull
-        program.emit_bool(column.notnull, base_reg + 3);
+        program.emit_bool(column.notnull(), base_reg + 3);
 
         // dflt_value
         match &column.default {
@@ -746,9 +832,13 @@ fn emit_columns_for_table_info(
         }
 
         // pk
-        program.emit_bool(column.primary_key, base_reg + 5);
+        program.emit_bool(column.primary_key(), base_reg + 5);
 
-        program.emit_result_row(base_reg, 6);
+        if extended {
+            program.emit_int(column_type, base_reg + 6);
+        }
+
+        program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
 }
 
@@ -893,4 +983,31 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
+}
+
+fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
+    if schema.tables.len() > 1 {
+        return Ok(false);
+    }
+    if let Some(table_arc) = schema.tables.values().next() {
+        let table_name = match table_arc.as_ref() {
+            crate::schema::Table::BTree(tbl) => &tbl.name,
+            crate::schema::Table::Virtual(tbl) => &tbl.name,
+            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
+        };
+
+        if table_name != "sqlite_schema" {
+            return Ok(false);
+        }
+    }
+
+    let db_size_result = pager
+        .io
+        .block(|| pager.with_header(|header| header.database_size.get()));
+
+    match db_size_result {
+        Err(_) => Ok(true),
+        Ok(0 | 1) => Ok(true),
+        Ok(_) => Ok(false),
+    }
 }

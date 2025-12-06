@@ -13,6 +13,7 @@ use super::{
 use crate::translate::{
     emitter::Resolver,
     expr::{BindingBehavior, WalkControl},
+    plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
     ast::Limit,
@@ -23,7 +24,7 @@ use crate::{
 };
 use crate::{
     function::{AggFunc, ExtFunc},
-    translate::expr::{bind_and_rewrite_expr, ParamState},
+    translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -240,7 +241,7 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.to_string());
+        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
     }
     Ok(())
 }
@@ -317,11 +318,26 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
+            let outer_query_refs_for_subquery = table_references
+                .outer_query_refs()
+                .iter()
+                .cloned()
+                .chain(
+                    ctes.iter()
+                        .cloned()
+                        .map(|t: JoinedTable| OuterQueryReference {
+                            identifier: t.identifier,
+                            internal_id: t.internal_id,
+                            table: t.table,
+                            col_used_mask: ColumnUsedMask::default(),
+                        }),
+                )
+                .collect::<Vec<_>>();
             let Plan::Select(subplan) = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
-                table_references.outer_query_refs(),
+                &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?
@@ -424,6 +440,8 @@ fn parse_table(
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id,
         });
         return Ok(());
@@ -475,7 +493,7 @@ fn parse_table(
         }
 
         // Check if this materialized view has persistent storage
-        let view_guard = view.lock().unwrap();
+        let view_guard = view.lock();
         let root_page = view_guard.get_root_page();
 
         if root_page == 0 {
@@ -518,6 +536,8 @@ fn parse_table(
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id,
         });
         return Ok(());
@@ -541,6 +561,8 @@ fn parse_table(
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
                 database_id,
             });
             return Ok(());
@@ -577,7 +599,7 @@ fn transform_args_into_where_terms(
     let mut args_iter = args.iter();
     let mut hidden_count = 0;
     for (i, col) in table.columns().iter().enumerate() {
-        if !col.hidden {
+        if !col.hidden() {
             continue;
         }
         hidden_count += 1;
@@ -587,7 +609,7 @@ fn transform_args_into_where_terms(
                 database: None,
                 table: internal_id,
                 column: i,
-                is_rowid_alias: col.is_rowid_alias,
+                is_rowid_alias: col.is_rowid_alias(),
             };
             let expr = match arg_expr.as_ref() {
                 Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
@@ -628,12 +650,13 @@ pub fn parse_from(
         return Ok(());
     }
 
-    let mut ctes_as_subqueries = vec![];
+    let mut ctes_as_subqueries: Vec<JoinedTable> = vec![];
 
     if let Some(with) = with {
         if with.recursive {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
         }
+
         for cte in with.ctes {
             if cte.materialized == Materialized::Yes {
                 crate::bail_parse_error!("Materialized CTEs are not yet supported");
@@ -646,6 +669,13 @@ pub fn parse_from(
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
+            if ctes_as_subqueries
+                .iter()
+                .any(|t| t.table.get_name() == cte_name_normalized)
+            {
+                crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+            }
+
             if resolver.schema.get_table(&cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
@@ -686,6 +716,7 @@ pub fn parse_from(
             let Plan::Select(cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
+
             ctes_as_subqueries.push(JoinedTable::new_subquery(
                 cte_name_normalized,
                 cte_plan,
@@ -730,7 +761,6 @@ pub fn parse_where(
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     connection: &Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
@@ -741,7 +771,6 @@ pub fn parse_where(
                 Some(table_references),
                 result_columns,
                 connection,
-                param_ctx,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
@@ -761,6 +790,8 @@ pub fn parse_where(
 pub fn determine_where_to_eval_term(
     term: &WhereTerm,
     join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
+    table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
         return Ok(EvalAt::Loop(
@@ -771,7 +802,7 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    determine_where_to_eval_expr(&term.expr, join_order)
+    determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -874,6 +905,7 @@ impl TableMask {
 pub fn table_mask_from_expr(
     top_level_expr: &Expr,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<TableMask> {
     let mut mask = TableMask::new();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -895,6 +927,34 @@ pub fn table_mask_from_expr(
                     crate::bail_parse_error!("table not found in joined_tables");
                 }
             }
+            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
+            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
+            // Hence, the tables referenced in subqueries must be added to the table mask.
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                let SubqueryState::Unevaluated { plan } = &subquery.state else {
+                    crate::bail_parse_error!("subquery has already been evaluated");
+                };
+                let used_outer_query_refs = plan
+                    .as_ref()
+                    .unwrap()
+                    .table_references
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|t| t.is_used());
+                for outer_query_ref in used_outer_query_refs {
+                    if let Some(table_idx) = table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|t| t.internal_id == outer_query_ref.internal_id)
+                    {
+                        mask.add_table(table_idx);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(WalkControl::Continue)
@@ -903,19 +963,72 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
+/// When a table referenced in the expression is not found in join_order, we check if it's
+/// a hash join build table. If so, we map the condition to the probe table's loop position.
 pub fn determine_where_to_eval_expr(
     top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
+    table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
+    // If the expression references no tables, it can be evaluated before any table loops are opened.
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let join_idx = join_order
-                    .iter()
-                    .position(|t| t.table_id == *table)
-                    .unwrap_or(usize::MAX);
+                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
+                    // Table not found in join_order. Check if it's a hash join build table.
+                    // If so, we need to evaluate the condition at the probe table's loop position.
+                    if let Some(tables) = table_references {
+                        for (probe_idx, member) in join_order.iter().enumerate() {
+                            let probe_table = &tables.joined_tables()[member.original_idx];
+                            if let Operation::HashJoin(ref hj) = probe_table.op {
+                                let build_table = &tables.joined_tables()[hj.build_table_idx];
+                                if build_table.internal_id == *table {
+                                    // This table is the build side of a hash join.
+                                    // Evaluate the condition at the probe table's loop position.
+                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
+                        }
+                    }
+                    // Must be an outer query reference; in that case, the table is already in scope.
+                    return Ok(WalkControl::Continue);
+                };
                 eval_at = eval_at.max(EvalAt::Loop(join_idx));
+            }
+            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
+            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                match &subquery.state {
+                    SubqueryState::Evaluated { evaluated_at } => {
+                        eval_at = eval_at.max(*evaluated_at);
+                    }
+                    SubqueryState::Unevaluated { plan } => {
+                        let used_outer_refs = plan
+                            .as_ref()
+                            .unwrap()
+                            .table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used());
+                        for outer_ref in used_outer_refs {
+                            let Some(join_idx) = join_order
+                                .iter()
+                                .position(|t| t.table_id == outer_ref.internal_id)
+                            else {
+                                continue;
+                            };
+                            eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+                }
             }
             _ => {}
         }
@@ -971,21 +1084,41 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
+    // this is called once for each join, so we only need to check the rightmost table
+    // against all previous tables for duplicates
+    let rightmost_table = table_references.joined_tables().last().unwrap();
+    let has_duplicate = table_references
+        .joined_tables()
+        .iter()
+        .take(table_references.joined_tables().len() - 1)
+        .any(|t| t.identifier == rightmost_table.identifier);
+
+    if has_duplicate
+        && !natural
+        && constraint
+            .as_ref()
+            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
+    {
+        // Duplicate table names are only allowed for NATURAL or USING joins
+        crate::bail_parse_error!(
+            "table name {} specified more than once - use an alias to disambiguate",
+            rightmost_table.identifier
+        );
+    }
     let constraint = if natural {
         assert!(table_references.joined_tables().len() >= 2);
-        let rightmost_table = table_references.joined_tables().last().unwrap();
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let mut distinct_names: Vec<ast::Name> = vec![];
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
         // SQLite doesn't use HIDDEN columns for NATURAL joins: https://www3.sqlite.org/src/info/ab09ef427181130b
-        for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden) {
+        for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden()) {
             let mut found_match = false;
             for left_table in table_references
                 .joined_tables()
                 .iter()
                 .take(table_references.joined_tables().len() - 1)
             {
-                for left_col in left_table.columns().iter().filter(|col| !col.hidden) {
+                for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
                     if left_col.name == right_col.name {
                         distinct_names.push(ast::Name::exact(
                             left_col.name.clone().expect("column name is None"),
@@ -1026,7 +1159,6 @@ fn parse_join(
                         Some(table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -1045,7 +1177,7 @@ fn parse_join(
                             .columns()
                             .iter()
                             .enumerate()
-                            .filter(|(_, col)| !natural || !col.hidden)
+                            .filter(|(_, col)| !natural || !col.hidden())
                             .find(|(_, col)| {
                                 col.name
                                     .as_ref()
@@ -1080,14 +1212,14 @@ fn parse_join(
                             database: None,
                             table: left_table_id,
                             column: left_col_idx,
-                            is_rowid_alias: left_col.is_rowid_alias,
+                            is_rowid_alias: left_col.is_rowid_alias(),
                         }),
                         ast::Operator::Equals,
                         Box::new(Expr::Column {
                             database: None,
                             table: right_table.internal_id,
                             column: right_col_idx,
-                            is_rowid_alias: right_col.is_rowid_alias,
+                            is_rowid_alias: right_col.is_rowid_alias(),
                         }),
                     );
 
@@ -1168,16 +1300,14 @@ where
 
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
-    limit: &mut Limit,
+    mut limit: Limit,
     connection: &std::sync::Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,
         None,
         None,
         connection,
-        param_ctx,
         BindingBehavior::TryResultColumnsFirst,
     )?;
     if let Some(ref mut off_expr) = limit.offset {
@@ -1186,9 +1316,8 @@ pub fn parse_limit(
             None,
             None,
             connection,
-            param_ctx,
             BindingBehavior::TryResultColumnsFirst,
         )?;
     }
-    Ok((Some(limit.expr.clone()), limit.offset.clone()))
+    Ok((Some(limit.expr), limit.offset))
 }

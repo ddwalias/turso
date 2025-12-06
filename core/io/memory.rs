@@ -1,11 +1,13 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::Result;
+use crate::turso_assert;
+use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
+use parking_lot::Mutex;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use tracing::debug;
 
@@ -35,17 +37,13 @@ impl Default for MemoryIO {
 
 impl Clock for MemoryIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 
 impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(
                 crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
@@ -61,10 +59,15 @@ impl IO for MemoryIO {
                 }),
             );
         }
-        Ok(files.get(path).unwrap().clone())
+        Ok(files
+            .get(path)
+            .ok_or(crate::LimboError::InternalError(
+                "file should exist after insert".to_string(),
+            ))?
+            .clone())
     }
     fn remove_file(&self, path: &str) -> Result<()> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         files.remove(path);
         Ok(())
     }
@@ -236,6 +239,30 @@ impl File for MemoryFile {
     fn size(&self) -> Result<u64> {
         tracing::debug!("size(path={}): {}", self.path, self.size.get());
         Ok(self.size.get())
+    }
+
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            if self.get_page(page_no).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        turso_assert!(
+            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            "hole must be page aligned"
+        );
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            unsafe { (*self.pages.get()).remove(&page_no) };
+        }
+        Ok(())
     }
 }
 

@@ -1,0 +1,1928 @@
+use crate::common::TempDatabase;
+
+#[turso_macros::test(mvcc)]
+fn test_create_trigger(db: TempDatabase) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x, y TEXT)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t1 BEFORE INSERT ON test BEGIN
+         INSERT INTO test VALUES (100, 'triggered');
+        END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1, 'hello')")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT * FROM test ORDER BY rowid").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).cast_text().unwrap().to_string(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Row inserted by trigger goes first
+    assert_eq!(results[0], (100, "triggered".to_string()));
+    assert_eq!(results[1], (1, "hello".to_string()));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_drop_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("CREATE TRIGGER t1 BEFORE INSERT ON test BEGIN SELECT 1; END")
+        .unwrap();
+
+    // Verify trigger exists
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(results.len(), 1);
+
+    conn.execute("DROP TRIGGER t1").unwrap();
+
+    // Verify trigger is gone
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(results.len(), 0);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_after_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (x INTEGER, y TEXT)")
+        .unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t1 AFTER INSERT ON test BEGIN
+         INSERT INTO log VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1, 'hello')")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).cast_text().unwrap().to_string(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0], (1, "hello".to_string()));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_when_clause(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (x INTEGER)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t1 AFTER INSERT ON test WHEN NEW.y > 10 BEGIN
+         INSERT INTO log VALUES (NEW.x);
+        END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1, 5)").unwrap();
+    conn.execute("INSERT INTO test VALUES (2, 15)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).as_int().unwrap());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0], 2);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_drop_table_drops_triggers(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TRIGGER t1 BEFORE INSERT ON test BEGIN SELECT 1; END")
+        .unwrap();
+
+    // Verify trigger exists
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(results.len(), 1);
+
+    conn.execute("DROP TABLE test").unwrap();
+
+    // Verify trigger is gone
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(results.len(), 0);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_new_old_references(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (msg TEXT)").unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1, 'hello')")
+        .unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t1 AFTER UPDATE ON test BEGIN
+         INSERT INTO log VALUES ('old=' || OLD.y || ' new=' || NEW.y);
+        END",
+    )
+    .unwrap();
+
+    conn.execute("UPDATE test SET y = 'world' WHERE x = 1")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT * FROM log").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0], "old=hello new=world");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_multiple_triggers_same_event(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (msg TEXT)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t1 BEFORE INSERT ON test BEGIN
+         INSERT INTO log VALUES ('trigger1');
+        END",
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t2 BEFORE INSERT ON test BEGIN
+         INSERT INTO log VALUES ('trigger2');
+        END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT * FROM log ORDER BY msg").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], "trigger1");
+    assert_eq!(results[1], "trigger2");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_two_triggers_on_same_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (x, msg TEXT)").unwrap();
+    conn.execute("CREATE TABLE log (msg TEXT)").unwrap();
+
+    // Trigger A: fires on INSERT to test, inserts into log and test (which would trigger B)
+    conn.execute(
+        "CREATE TRIGGER trigger_a AFTER INSERT ON test BEGIN
+         INSERT INTO log VALUES ('trigger_a fired for x=' || NEW.x);
+         INSERT INTO test VALUES (NEW.x + 100, 'from_a');
+        END",
+    )
+    .unwrap();
+
+    // Trigger B: fires on INSERT to test, inserts into log and test (which would trigger A)
+    conn.execute(
+        "CREATE TRIGGER trigger_b AFTER INSERT ON test BEGIN
+         INSERT INTO log VALUES ('trigger_b fired for x=' || NEW.x);
+         INSERT INTO test VALUES (NEW.x + 200, 'from_b');
+        END",
+    )
+    .unwrap();
+
+    // Insert initial row - this should trigger A, which triggers B, which tries to trigger A again (prevented)
+    conn.execute("INSERT INTO test VALUES (1, 'initial')")
+        .unwrap();
+
+    // Check log entries to verify recursion was prevented
+    let mut stmt = conn.prepare("SELECT * FROM log ORDER BY rowid").unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // At minimum, we should see both triggers fire and not infinite loop
+    assert!(
+        results.len() >= 2,
+        "Expected at least 2 log entries, got {}",
+        results.len()
+    );
+    assert!(
+        results.iter().any(|s| s.contains("trigger_a")),
+        "trigger_a should have fired"
+    );
+    assert!(
+        results.iter().any(|s| s.contains("trigger_b")),
+        "trigger_b should have fired"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_mutual_recursion(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER, msg TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (id INTEGER, msg TEXT)")
+        .unwrap();
+
+    // Trigger on T: fires on INSERT to t, inserts into u
+    conn.execute(
+        "CREATE TRIGGER trigger_on_t AFTER INSERT ON t BEGIN
+         INSERT INTO u VALUES (NEW.id + 1000, 'from_t');
+        END",
+    )
+    .unwrap();
+
+    // Trigger on U: fires on INSERT to u, inserts into t
+    conn.execute(
+        "CREATE TRIGGER trigger_on_u AFTER INSERT ON u BEGIN
+         INSERT INTO t VALUES (NEW.id + 2000, 'from_u');
+        END",
+    )
+    .unwrap();
+
+    // Insert initial row into t - this should trigger the chain
+    conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+
+    // Check that both tables have entries
+    let mut stmt = conn.prepare("SELECT * FROM t ORDER BY rowid").unwrap();
+    let mut t_results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                t_results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).cast_text().unwrap().to_string(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let mut stmt = conn.prepare("SELECT * FROM u ORDER BY rowid").unwrap();
+    let mut u_results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                u_results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).cast_text().unwrap().to_string(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Verify the chain executed without infinite recursion
+    assert!(!t_results.is_empty(), "Expected at least 1 entry in t");
+    assert!(!u_results.is_empty(), "Expected at least 1 entry in u");
+
+    // Verify initial insert
+    assert_eq!(t_results[0], (1, "initial".to_string()));
+
+    // Verify trigger on t fired (inserted into u)
+    assert_eq!(u_results[0], (1001, "from_t".to_string()));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_after_insert_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table and log table
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit_log (action TEXT, item_id INTEGER, item_name TEXT)")
+        .unwrap();
+
+    // Create AFTER INSERT trigger
+    conn.execute(
+        "CREATE TRIGGER after_insert_items
+         AFTER INSERT ON items
+         BEGIN
+             INSERT INTO audit_log VALUES ('INSERT', NEW.id, NEW.name);
+         END",
+    )
+    .unwrap();
+
+    // Insert data
+    conn.execute("INSERT INTO items VALUES (1, 'apple')")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (2, 'banana')")
+        .unwrap();
+
+    // Verify audit log
+    let mut stmt = conn
+        .prepare("SELECT * FROM audit_log ORDER BY rowid")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).cast_text().unwrap().to_string(),
+                    row.get_value(1).as_int().unwrap(),
+                    row.get_value(2).cast_text().unwrap().to_string(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], ("INSERT".to_string(), 1, "apple".to_string()));
+    assert_eq!(results[1], ("INSERT".to_string(), 2, "banana".to_string()));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_before_update_of_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table with multiple columns
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE price_history (product_id INTEGER, old_price INTEGER, new_price INTEGER)",
+    )
+    .unwrap();
+
+    // Create BEFORE UPDATE OF trigger - only fires when price column is updated
+    conn.execute(
+        "CREATE TRIGGER before_update_price
+         BEFORE UPDATE OF price ON products
+         BEGIN
+             INSERT INTO price_history VALUES (OLD.id, OLD.price, NEW.price);
+         END",
+    )
+    .unwrap();
+
+    // Insert initial data
+    conn.execute("INSERT INTO products VALUES (1, 'widget', 100)")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (2, 'gadget', 200)")
+        .unwrap();
+
+    // Update price - should fire trigger
+    conn.execute("UPDATE products SET price = 150 WHERE id = 1")
+        .unwrap();
+
+    // Update name only - should NOT fire trigger
+    conn.execute("UPDATE products SET name = 'super widget' WHERE id = 1")
+        .unwrap();
+
+    // Update both name and price - should fire trigger
+    conn.execute("UPDATE products SET name = 'mega gadget', price = 250 WHERE id = 2")
+        .unwrap();
+
+    // Verify price history
+    let mut stmt = conn
+        .prepare("SELECT * FROM price_history ORDER BY rowid")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).as_int().unwrap(),
+                    row.get_value(2).as_int().unwrap(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Should have 2 entries (not 3, because name-only update didn't fire)
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], (1, 100, 150));
+    assert_eq!(results[1], (2, 200, 250));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_after_update_of_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE salary_changes (emp_id INTEGER, old_salary INTEGER, new_salary INTEGER, change_amount INTEGER)")
+        .unwrap();
+
+    // Create AFTER UPDATE OF trigger with multiple statements
+    conn.execute(
+        "CREATE TRIGGER after_update_salary
+         AFTER UPDATE OF salary ON employees
+         BEGIN
+             INSERT INTO salary_changes VALUES (NEW.id, OLD.salary, NEW.salary, NEW.salary - OLD.salary);
+         END",
+    )
+    .unwrap();
+
+    // Insert initial data
+    conn.execute("INSERT INTO employees VALUES (1, 'Alice', 50000)")
+        .unwrap();
+    conn.execute("INSERT INTO employees VALUES (2, 'Bob', 60000)")
+        .unwrap();
+
+    // Update salary
+    conn.execute("UPDATE employees SET salary = 55000 WHERE id = 1")
+        .unwrap();
+    conn.execute("UPDATE employees SET salary = 65000 WHERE id = 2")
+        .unwrap();
+
+    // Verify salary changes
+    let mut stmt = conn
+        .prepare("SELECT * FROM salary_changes ORDER BY rowid")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).as_int().unwrap(),
+                    row.get_value(2).as_int().unwrap(),
+                    row.get_value(3).as_int().unwrap(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], (1, 50000, 55000, 5000));
+    assert_eq!(results[1], (2, 60000, 65000, 5000));
+}
+
+fn log(s: &str) -> &str {
+    tracing::info!("{}", s);
+    s
+}
+
+#[turso_macros::test(mvcc)]
+fn test_before_delete_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create tables
+    conn.execute(log(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)",
+    ))
+    .unwrap();
+    conn.execute(log(
+        "CREATE TABLE deleted_users (id INTEGER, username TEXT, deleted_at INTEGER)",
+    ))
+    .unwrap();
+
+    // Create BEFORE DELETE trigger
+    conn.execute(log("CREATE TRIGGER before_delete_users
+         BEFORE DELETE ON users
+         BEGIN
+             INSERT INTO deleted_users VALUES (OLD.id, OLD.username, 12345);
+         END"))
+        .unwrap();
+
+    // Insert data
+    conn.execute(log("INSERT INTO users VALUES (1, 'alice')"))
+        .unwrap();
+    conn.execute(log("INSERT INTO users VALUES (2, 'bob')"))
+        .unwrap();
+    conn.execute(log("INSERT INTO users VALUES (3, 'charlie')"))
+        .unwrap();
+
+    // Delete some users
+    conn.execute(log("DELETE FROM users WHERE id = 2")).unwrap();
+    conn.execute(log("DELETE FROM users WHERE id = 3")).unwrap();
+
+    // Verify deleted_users table
+    let mut stmt = conn
+        .prepare(log("SELECT * FROM deleted_users ORDER BY id"))
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).cast_text().unwrap().to_string(),
+                    row.get_value(2).as_int().unwrap(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], (2, "bob".to_string(), 12345));
+    assert_eq!(results[1], (3, "charlie".to_string(), 12345));
+
+    // Verify remaining users
+    let mut stmt = conn.prepare(log("SELECT COUNT(*) FROM users")).unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                assert_eq!(row.get_value(0).as_int().unwrap(), 1);
+                break;
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_after_delete_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create tables
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE order_archive (order_id INTEGER, customer_id INTEGER, amount INTEGER)",
+    )
+    .unwrap();
+
+    // Create AFTER DELETE trigger
+    conn.execute(
+        "CREATE TRIGGER after_delete_orders
+         AFTER DELETE ON orders
+         BEGIN
+             INSERT INTO order_archive VALUES (OLD.id, OLD.customer_id, OLD.amount);
+         END",
+    )
+    .unwrap();
+
+    // Insert data
+    conn.execute("INSERT INTO orders VALUES (1, 100, 50)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 101, 75)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (3, 100, 100)")
+        .unwrap();
+
+    // Delete orders
+    conn.execute("DELETE FROM orders WHERE customer_id = 100")
+        .unwrap();
+
+    // Verify archive
+    let mut stmt = conn
+        .prepare("SELECT * FROM order_archive ORDER BY order_id")
+        .unwrap();
+    let mut results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).as_int().unwrap(),
+                    row.get_value(2).as_int().unwrap(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], (1, 100, 50));
+    assert_eq!(results[1], (3, 100, 100));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_trigger_with_multiple_statements(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create tables
+    conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE transactions (account_id INTEGER, old_balance INTEGER, new_balance INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE audit (message TEXT)").unwrap();
+
+    // Create trigger with multiple statements
+    conn.execute(
+        "CREATE TRIGGER track_balance_changes
+         AFTER UPDATE OF balance ON accounts
+         BEGIN
+             INSERT INTO transactions VALUES (NEW.id, OLD.balance, NEW.balance);
+             INSERT INTO audit VALUES ('Balance changed for account ' || NEW.id);
+         END",
+    )
+    .unwrap();
+
+    // Insert initial data
+    conn.execute("INSERT INTO accounts VALUES (1, 1000)")
+        .unwrap();
+    conn.execute("INSERT INTO accounts VALUES (2, 2000)")
+        .unwrap();
+
+    // Update balances
+    conn.execute("UPDATE accounts SET balance = 1500 WHERE id = 1")
+        .unwrap();
+    conn.execute("UPDATE accounts SET balance = 2500 WHERE id = 2")
+        .unwrap();
+
+    // Verify transactions table
+    let mut stmt = conn
+        .prepare("SELECT * FROM transactions ORDER BY rowid")
+        .unwrap();
+    let mut trans_results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trans_results.push((
+                    row.get_value(0).as_int().unwrap(),
+                    row.get_value(1).as_int().unwrap(),
+                    row.get_value(2).as_int().unwrap(),
+                ));
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(trans_results.len(), 2);
+    assert_eq!(trans_results[0], (1, 1000, 1500));
+    assert_eq!(trans_results[1], (2, 2000, 2500));
+
+    // Verify audit table
+    let mut stmt = conn.prepare("SELECT * FROM audit ORDER BY rowid").unwrap();
+    let mut audit_results = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                audit_results.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(audit_results.len(), 2);
+    assert_eq!(audit_results[0], "Balance changed for account 1");
+    assert_eq!(audit_results[1], "Balance changed for account 2");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_new_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table with columns
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create trigger that references y via NEW.y
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO t VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Attempting to drop column y should fail because trigger references it
+    let result = conn.execute("ALTER TABLE t DROP COLUMN y");
+    assert!(
+        result.is_err(),
+        "Dropping column y should fail when trigger references NEW.y"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        "Error should mention column drop and trigger: {error_msg}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_old_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table with columns
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create trigger that references y via OLD.y
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         INSERT INTO t VALUES (OLD.x, OLD.y);
+        END",
+    )
+    .unwrap();
+
+    // Attempting to drop column y should fail because trigger references it
+    let result = conn.execute("ALTER TABLE t DROP COLUMN y");
+    assert!(
+        result.is_err(),
+        "Dropping column y should fail when trigger references OLD.y"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        "Error should mention column drop and trigger: {error_msg}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table with columns
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create trigger that references y as unqualified column (in WHEN clause)
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t WHEN y > 10 BEGIN
+         INSERT INTO t VALUES (NEW.x, 100);
+        END",
+    )
+    .unwrap();
+
+    // Attempting to drop column y should fail because trigger references it
+    let result = conn.execute("ALTER TABLE t DROP COLUMN y");
+    assert!(
+        result.is_err(),
+        "Dropping column y should fail when trigger references it in WHEN clause"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("cannot drop column") && error_msg.contains("trigger"),
+        "Error should mention column drop and trigger: {error_msg}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_succeeds_when_trigger_references_other_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER)").unwrap();
+
+    // Create trigger on t that references column from u (not t)
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(z) VALUES (NEW.x);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column y from t should succeed because trigger doesn't reference it
+    conn.execute("ALTER TABLE t DROP COLUMN y").unwrap();
+
+    // Verify column was dropped
+    let mut stmt = conn.prepare("PRAGMA table_info(t)").unwrap();
+    let mut columns = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                columns.push(row.get_value(1).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Should only have x column now
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0], "x");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_from_other_table_causes_parse_error_when_trigger_fires(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER, zer INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references column zer from u
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(z, zer) VALUES (NEW.x, NEW.x);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column zer from u should succeed (trigger is on t, not u)
+    conn.execute("ALTER TABLE u DROP COLUMN zer").unwrap();
+
+    // Verify column was dropped
+    let mut stmt = conn.prepare("PRAGMA table_info(u)").unwrap();
+    let mut columns = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                columns.push(row.get_value(1).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Should only have z column now
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0], "z");
+
+    // Now trying to insert into t should fail because trigger references non-existent column zer
+    let result = conn.execute("INSERT INTO t VALUES (1)");
+    assert!(
+        result.is_err(),
+        "Insert should fail because trigger references non-existent column zer"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("no column named") || error_msg.contains("zer"),
+        "Error should mention missing column: {error_msg}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_on_owning_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references y via NEW.y
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO t VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Rename column y to y_new
+    conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new")
+        .unwrap();
+
+    // Verify trigger SQL was updated
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Trigger SQL should reference y_new instead of y
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized_sql,
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN INSERT INTO t VALUES (NEW.x, NEW.y_new); END"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_referencing_other_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER, zer INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references column z from u
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(z, zer) VALUES (NEW.x, NEW.x);
+        END",
+    )
+    .unwrap();
+
+    // Rename column z to zoo in table u
+    conn.execute("ALTER TABLE u RENAME COLUMN z TO zoo")
+        .unwrap();
+
+    // Verify trigger SQL was updated to reference zoo
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Trigger SQL should reference zoo instead of z
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized_sql,
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN INSERT INTO u (zoo, zer) VALUES (NEW.x, NEW.x); END"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER, zer INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references y multiple times and z from u
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(z, zer) VALUES (NEW.y, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Rename column y to y_new in table t
+    conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new")
+        .unwrap();
+
+    // Verify trigger SQL was updated
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Trigger SQL should reference y_new instead of y
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized_sql,
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN INSERT INTO u (z, zer) VALUES (NEW.y_new, NEW.y_new); END"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_column(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create trigger with WHEN clause referencing y
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t WHEN y > 10 BEGIN
+         INSERT INTO t VALUES (NEW.x, 100);
+        END",
+    )
+    .unwrap();
+
+    // Rename column y to y_new should fail (SQLite fails if WHEN clause references the column)
+    let result = conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN should fail when trigger WHEN clause references the column"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("error in trigger") && error_msg.contains("no such column"),
+        "Error should mention trigger and column: {error_msg}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_multiple_triggers(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create multiple triggers referencing y
+    conn.execute(
+        "CREATE TRIGGER t1 BEFORE INSERT ON t BEGIN
+         INSERT INTO t VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER t2 AFTER UPDATE ON t BEGIN
+         INSERT INTO t VALUES (OLD.x, OLD.y);
+        END",
+    )
+    .unwrap();
+
+    // Rename column y to y_new
+    conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new")
+        .unwrap();
+
+    // Verify both triggers were updated
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' ORDER BY name")
+        .unwrap();
+    let mut trigger_sqls = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sqls.push(row.get_value(0).cast_text().unwrap().to_string());
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Both triggers should reference y_new
+    assert_eq!(trigger_sqls.len(), 2);
+    let normalized_t1 = trigger_sqls[0]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized_t2 = trigger_sqls[1]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        normalized_t1,
+        "CREATE TRIGGER t1 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES (NEW.x, NEW.y_new); END"
+    );
+    assert_eq!(
+        normalized_t2,
+        "CREATE TRIGGER t2 AFTER UPDATE ON t BEGIN INSERT INTO t VALUES (OLD.x, OLD.y_new); END"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_with_old_reference_in_update_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+
+    // Create UPDATE trigger that references OLD.y
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         INSERT INTO t VALUES (OLD.x, OLD.y);
+        END",
+    )
+    .unwrap();
+
+    // Attempting to drop column y should fail
+    let result = conn.execute("ALTER TABLE t DROP COLUMN y");
+    assert!(
+        result.is_err(),
+        "Dropping column y should fail when UPDATE trigger references OLD.y"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_insert_column_list(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER, zer INTEGER)")
+        .unwrap();
+
+    // Create trigger that inserts into u with explicit column list
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(z, zer) VALUES (NEW.x, NEW.x);
+        END",
+    )
+    .unwrap();
+
+    // Rename column zer to zercher in table u
+    conn.execute("ALTER TABLE u RENAME COLUMN zer TO zercher")
+        .unwrap();
+
+    // Verify trigger SQL was updated
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    // Trigger SQL should reference zercher in INSERT column list
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized_sql,
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN INSERT INTO u (z, zercher) VALUES (NEW.x, NEW.x); END"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_trigger_table_does_not_rewrite_other_table_column(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references both t.x (via NEW.x) and u.x (in INSERT column list)
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(x, z) VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t (the trigger's owning table)
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL was updated correctly:
+    // - NEW.x should become NEW.x_new (refers to table t)
+    // - INSERT INTO u(x, ...) should remain as x (refers to table u, not t)
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // NEW.x should be rewritten to NEW.x_new
+    assert!(
+        normalized_sql.contains("NEW.x_new"),
+        "Trigger SQL should contain NEW.x_new: {normalized_sql}",
+    );
+    // INSERT INTO u (x, ...) should still have x (not x_new) because it refers to table u's column
+    assert!(
+        normalized_sql.contains("INSERT INTO u (x,") || normalized_sql.contains("INSERT INTO u(x,"),
+        "Trigger SQL should contain INSERT INTO u (x, (not u (x_new,): {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("INSERT INTO u (x_new,") && !normalized_sql.contains("INSERT INTO u(x_new,"),
+        "Trigger SQL should NOT contain INSERT INTO u (x_new, (x refers to table u): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_insert_target_table_does_not_rewrite_trigger_table_column(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that references both t.x (via NEW.x) and u.x (in INSERT column list)
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(x, z) VALUES (NEW.x, NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table u (the INSERT target table)
+    conn.execute("ALTER TABLE u RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL was updated correctly:
+    // - NEW.x should remain as NEW.x (refers to table t, not u)
+    // - INSERT INTO u(x, ...) should become u(x_new, ...) (refers to table u)
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // NEW.x should remain as NEW.x (not rewritten because it refers to table t)
+    assert!(
+        normalized_sql.contains("NEW.x"),
+        "Trigger SQL should contain NEW.x (not NEW.x_new): {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("NEW.x_new"),
+        "Trigger SQL should NOT contain NEW.x_new (x refers to table t, not u): {normalized_sql}",
+    );
+    // INSERT INTO u (x_new, ...) should have x_new (rewritten because it refers to table u)
+    assert!(
+        normalized_sql.contains("INSERT INTO u (x_new,")
+            || normalized_sql.contains("INSERT INTO u(x_new,"),
+        "Trigger SQL should contain INSERT INTO u (x_new, (not u (x,): {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("INSERT INTO u (x,") && !normalized_sql.contains("INSERT INTO u(x,"),
+        "Trigger SQL should NOT contain INSERT INTO u (x, (x was renamed to x_new in table u): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_where_clause_does_not_rewrite_target_table_column(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates u, with WHERE clause referencing u.x (unqualified)
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         UPDATE u SET z = NEW.x WHERE x = OLD.x;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t (the trigger's owning table)
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL: WHERE x should remain as x (refers to table u, not t)
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // NEW.x and OLD.x should be rewritten to x_new
+    assert!(
+        normalized_sql.contains("NEW.x_new") && normalized_sql.contains("OLD.x_new"),
+        "Trigger SQL should contain NEW.x_new and OLD.x_new: {normalized_sql}",
+    );
+    // WHERE x should remain as x (not x_new) because it refers to table u's column
+    assert!(
+        normalized_sql.contains("WHERE x =") || normalized_sql.contains("WHERE x="),
+        "Trigger SQL should contain WHERE x = (not WHERE x_new =): {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("WHERE x_new =") && !normalized_sql.contains("WHERE x_new="),
+        "Trigger SQL should NOT contain WHERE x_new = (x refers to table u): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_set_column_name_rewritten(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates u, setting u.x
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         UPDATE u SET x = NEW.x WHERE u.x = OLD.x;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table u (the UPDATE target table)
+    conn.execute("ALTER TABLE u RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL: SET x should become SET x_new, WHERE u.x should become u.x_new
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // SET x should become SET x_new
+    assert!(
+        normalized_sql.contains("SET x_new =") || normalized_sql.contains("SET x_new="),
+        "Trigger SQL should contain SET x_new =: {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("SET x =") && !normalized_sql.contains("SET x="),
+        "Trigger SQL should NOT contain SET x = (x was renamed to x_new): {normalized_sql}",
+    );
+    // WHERE u.x should become u.x_new
+    assert!(
+        normalized_sql.contains("u.x_new =") || normalized_sql.contains("u.x_new="),
+        "Trigger SQL should contain u.x_new =: {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_delete_where_clause_does_not_rewrite_target_table_column(
+    db: TempDatabase,
+) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that deletes from u, with WHERE clause referencing u.x (unqualified)
+    conn.execute(
+        "CREATE TRIGGER tu AFTER DELETE ON t BEGIN
+         DELETE FROM u WHERE x = OLD.x;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t (the trigger's owning table)
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL: WHERE x should remain as x (refers to table u, not t)
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // OLD.x should be rewritten to OLD.x_new
+    assert!(
+        normalized_sql.contains("OLD.x_new"),
+        "Trigger SQL should contain OLD.x_new: {normalized_sql}",
+    );
+    // WHERE x should remain as x (not x_new) because it refers to table u's column
+    assert!(
+        normalized_sql.contains("WHERE x =") || normalized_sql.contains("WHERE x="),
+        "Trigger SQL should contain WHERE x = (not WHERE x_new =): {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("WHERE x_new =") && !normalized_sql.contains("WHERE x_new="),
+        "Trigger SQL should NOT contain WHERE x_new = (x refers to table u): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_of_column_list_rewritten(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger with UPDATE OF x
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE OF x ON t BEGIN
+         UPDATE u SET z = NEW.x WHERE x = OLD.x;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL: UPDATE OF x should become UPDATE OF x_new
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // UPDATE OF x should become UPDATE OF x_new
+    assert!(
+        normalized_sql.contains("UPDATE OF x_new"),
+        "Trigger SQL should contain UPDATE OF x_new: {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("UPDATE OF x,") && !normalized_sql.contains("UPDATE OF x "),
+        "Trigger SQL should NOT contain UPDATE OF x (x was renamed to x_new): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_of_multiple_columns_rewritten(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger with UPDATE OF x, y
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE OF x, y ON t BEGIN
+         UPDATE u SET z = NEW.x WHERE x = OLD.x;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new")
+        .unwrap();
+
+    // Verify trigger SQL: UPDATE OF x, y should become UPDATE OF x_new, y
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
+        .unwrap();
+    let mut trigger_sql = String::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    // UPDATE OF x, y should become UPDATE OF x_new, y
+    assert!(
+        normalized_sql.contains("UPDATE OF x_new, y")
+            || normalized_sql.contains("UPDATE OF x_new,y"),
+        "Trigger SQL should contain UPDATE OF x_new, y: {normalized_sql}",
+    );
+    assert!(
+        !normalized_sql.contains("UPDATE OF x,") && !normalized_sql.contains("UPDATE OF x "),
+        "Trigger SQL should NOT contain UPDATE OF x (x was renamed to x_new): {normalized_sql}",
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_insert_targets_other_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that inserts into u(x) - this should NOT prevent dropping x from t
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(x) VALUES (NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (INSERT INTO u(x) refers to u.x, not t.x)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_update_targets_other_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates u SET x = ... - this should NOT prevent dropping x from t
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         UPDATE u SET x = NEW.y WHERE z = 1;
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (UPDATE u SET x refers to u.x, not t.x)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_insert_targets_owning_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that inserts into t(x) - SQLite allows DROP COLUMN here
+    // The error only occurs when the trigger is actually executed
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO t(x) VALUES (NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (SQLite allows this)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+
+    // Verify that executing the trigger now causes an error
+    let result = conn.execute("INSERT INTO t VALUES (5)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail because trigger references dropped column"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates t SET x = ... - SQLite allows DROP COLUMN here
+    // The error only occurs when the trigger is actually executed
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         UPDATE t SET x = NEW.y WHERE y = 1;
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (SQLite allows this)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+
+    // Verify that executing the trigger now causes an error
+    let result = conn.execute("INSERT INTO t VALUES (5)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail because trigger references dropped column"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER)").unwrap();
+
+    // Note: SQLite doesn't support qualified references to the trigger's owning table (t.x).
+    // SQLite fails the RENAME COLUMN operation with "error in trigger tu: no such column: t.x".
+    // We match SQLite's behavior - the rename should fail.
+
+    // Create trigger on t that uses qualified reference t.x (invalid in SQLite)
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         UPDATE u SET z = t.x WHERE z = 1;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t should fail (SQLite fails with "no such column: t.x")
+    let result = conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN should fail when trigger uses qualified reference to trigger table"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("error in trigger") || error_msg.contains("no such column"),
+        "Error should mention trigger or column: {error_msg}",
+    );
+}

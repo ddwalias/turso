@@ -58,15 +58,16 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
+use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -899,7 +900,7 @@ impl PageContent {
 /// if allow_empty_read is set, than empty read will be raise error for the page, but will not panic
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
-    db_file: DatabaseFile,
+    db_file: &dyn DatabaseStorage,
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
@@ -1076,7 +1077,7 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: DatabaseFile, syncing: Arc<AtomicBool>) -> Result<Completion> {
+pub fn begin_sync(db_file: &dyn DatabaseStorage, syncing: Arc<AtomicBool>) -> Result<Completion> {
     assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
@@ -1420,8 +1421,10 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 );
             }
 
+            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+            let val = unsafe { str::from_utf8_unchecked(&buf[..content_size]) };
             Ok((
-                ValueRef::Text(&buf[..content_size], TextSubtype::Text),
+                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
             ))
         }
@@ -1484,6 +1487,44 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
         9 => Ok(1),
         _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
+}
+
+/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
+///
+/// This function is a performance-optimized version of `read_varint()` that handles
+/// the most common varint cases inline before falling back to the full implementation.
+/// It follows the same varint encoding as SQLite.
+///
+/// # Optimized Cases
+///
+/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
+/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
+/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
+///
+/// This function is similar to `sqlite3GetVarint32`
+#[inline(always)]
+pub fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
+    // Fast path: Single-byte varint
+    if let Some(&first_byte) = buf.first() {
+        if first_byte & 0x80 == 0 {
+            return Ok((first_byte as u64, 1));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    // Fast path: Two-byte varint
+    if let Some(&second_byte) = buf.get(1) {
+        if second_byte & 0x80 == 0 {
+            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
+            return Ok((v, 2));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    //Fallback: Multi-byte varint
+    read_varint(buf)
 }
 
 #[inline(always)]
@@ -1563,7 +1604,7 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
         return 9;
     }
 
-    let mut encoded: [u8; 10] = [0; 10];
+    let mut encoded: [u8; 9] = [0; 9];
     let mut bytes = value;
     let mut n = 0;
     while bytes != 0 {
@@ -1608,7 +1649,7 @@ pub fn build_shared_wal(
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
         transaction_count: AtomicU64::new(0),
-        frame_cache: Arc::new(SpinLock::new(HashMap::new())),
+        frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
         last_checksum: (0, 0),
         file: Some(file.clone()),
         read_locks,
@@ -1673,7 +1714,7 @@ struct StreamingState {
     frame_idx: u64,
     cumulative_checksum: (u32, u32),
     last_valid_frame: u64,
-    pending_frames: HashMap<u64, Vec<u64>>,
+    pending_frames: FxHashMap<u64, Vec<u64>>,
     page_size: usize,
     use_native_endian: bool,
     header_valid: bool,
@@ -1698,7 +1739,7 @@ impl StreamingWalReader {
                 frame_idx: 1,
                 cumulative_checksum: (0, 0),
                 last_valid_frame: 0,
-                pending_frames: HashMap::new(),
+                pending_frames: FxHashMap::default(),
                 page_size: 0,
                 use_native_endian: false,
                 header_valid: false,
@@ -1912,7 +1953,7 @@ impl StreamingWalReader {
         wfs.loaded.store(true, Ordering::SeqCst);
 
         self.done.store(true, Ordering::Release);
-        tracing::info!(
+        tracing::debug!(
             "WAL loading complete: {} frames processed, last commit at frame {}",
             st.frame_idx - 1,
             max_frame

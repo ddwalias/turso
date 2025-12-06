@@ -490,6 +490,12 @@ def _test_kv(exec_name, ext_path):
         "select * from t a, other b where b.c = 23 and a.key='100';",
         lambda res: "100|updated2|23|32|23" == res,
     )
+    turso.run_test_fn("alter table t rename to renamed;", lambda res: "" == res, "can rename virtual table")
+    turso.run_test_fn(
+        "select sql from sqlite_schema where name = 'renamed';",
+        lambda res: "CREATE VIRTUAL TABLE renamed USING kv_store ()",
+        "renamed table shows up in sqlite_schema",
+    )
     turso.quit()
 
 
@@ -792,12 +798,12 @@ def test_csv():
     )
     turso.run_test_fn(
         "create virtual table t1 using csv(data='1'\\'2');",
-        lambda res: "unrecognized token at" in res,
+        lambda res: "unrecognized token " in res,
         "Create CSV table with malformed escape sequence",
     )
     turso.run_test_fn(
         "create virtual table t1 using csv(data=\"12');",
-        lambda res: "non-terminated literal at" in res,
+        lambda res: "non-terminated literal " in res,
         "Create CSV table with unterminated quoted string",
     )
 

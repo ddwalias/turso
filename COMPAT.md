@@ -4,7 +4,7 @@ This document describes the compatibility of Turso with SQLite.
 
 ## Table of contents
 
-- [Turso compatibility with SQLite](#limbo-compatibility-with-sqlite)
+- [Turso compatibility with SQLite](#turso-compatibility-with-sqlite)
   - [Table of contents](#table-of-contents)
   - [Overview](#overview)
     - [Features](#features)
@@ -164,7 +164,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA synchronous               | Partial    | `OFF` and `FULL` supported                   |
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
-| PRAGMA table_xinfo               | No         |                                              |
+| PRAGMA table_xinfo               | Yes        |                                              |
 | PRAGMA temp_store                | No         |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA threads                   | No         |                                              |
@@ -200,8 +200,9 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | IS (NOT)                  | Yes     |                                          |
 | IS (NOT) DISTINCT FROM    | Yes     |                                          |
 | (NOT) BETWEEN ... AND ... | Yes     | Expression is rewritten in the optimizer |
-| (NOT) IN (subquery)       | No      |                                          |
-| (NOT) EXISTS (subquery)   | No      |                                          |
+| (NOT) IN (SELECT...)       | Yes      |                                          |
+| (NOT) EXISTS (SELECT...)   | Yes      |                                          |
+| x <operator> (SELECT...))   | Partial  | Only scalar subqueries supported, i.e. not (x,y) = (SELECT...)
 | CASE WHEN THEN ELSE END   | Yes     |                                          |
 | RAISE                     | No      |                                          |
 
@@ -388,7 +389,7 @@ Modifiers:
 | json_type(json)                    | Yes     |                                                                                                                                              |
 | json_type(json,path)               | Yes     |                                                                                                                                              |
 | json_valid(json)                   | Yes     |                                                                                                                                              |
-| json_valid(json,flags)             |         |                                                                                                                                              |
+| json_valid(json,flags)             | Yes     |                                                                                                                                              |
 | json_quote(value)                  | Yes     |                                                                                                                                              |
 | json_group_array(value)            | Yes     |                                                                                                                                              |
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |
@@ -452,6 +453,8 @@ Modifiers:
 | FkCounter      | Yes    |         |
 | FkIfZero       | Yes    |         |
 | Found          | Yes    |         |
+| Filter         | Yes    |         |
+| FilterAdd      | Yes    |         |
 | Function       | Yes    |         |
 | Ge             | Yes    |         |
 | Gosub          | Yes    |         |
@@ -559,14 +562,14 @@ Modifiers:
 | TableLock      | No     |         |
 | Trace          | No     |         |
 | Transaction    | Yes    |         |
-| VBegin         | No     |         |
+| VBegin         | Yes    |         |
 | VColumn        | Yes    |         |
 | VCreate        | Yes    |         |
 | VDestroy       | Yes    |         |
 | VFilter        | Yes    |         |
 | VNext          | Yes    |         |
 | VOpen          | Yes    |         |
-| VRename        | No     |         |
+| VRename        | Yes    |         |
 | VUpdate        | Yes    |         |
 | Vacuum         | No     |         |
 | Variable       | Yes    |         |

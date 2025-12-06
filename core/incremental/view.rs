@@ -7,11 +7,12 @@ use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -39,6 +40,11 @@ pub enum PopulateState {
     /// Population complete
     Done,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for PopulateState {}
+unsafe impl Sync for PopulateState {}
 
 /// State machine for merge_delta to handle I/O operations
 impl fmt::Debug for PopulateState {
@@ -130,6 +136,11 @@ pub struct AllViewsTxState {
     states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for AllViewsTxState {}
+unsafe impl Sync for AllViewsTxState {}
+
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
@@ -209,6 +220,11 @@ pub struct IncrementalView {
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for IncrementalView {}
+unsafe impl Sync for IncrementalView {}
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit
@@ -532,7 +548,11 @@ impl IncrementalView {
                 );
                 // Only add if there's actually a condition for this table
                 if let Some(condition) = table_specific_condition {
-                    let conditions = table_conditions.get_mut(table_name).unwrap();
+                    let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "table_conditions should have entry for table_name".to_string(),
+                        )
+                    })?;
                     conditions.push(Some(condition));
                 }
             }
@@ -542,7 +562,11 @@ impl IncrementalView {
             // explicitly, because the same table may appear in many conditions - some of which
             // have filters that would otherwise be applied.
             for table_name in table_map.keys() {
-                let conditions = table_conditions.get_mut(table_name).unwrap();
+                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "table_conditions should have entry for table_name".to_string(),
+                    )
+                })?;
                 conditions.push(None);
             }
         }
@@ -670,7 +694,7 @@ impl IncrementalView {
 
         for table in referenced_tables {
             // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias);
+            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias());
 
             // Select all columns. The circuit will handle filtering and projection
             // If there's a rowid alias, we don't need to select rowid separately
@@ -1206,7 +1230,11 @@ impl IncrementalView {
                         match stmt.step()? {
                             crate::vdbe::StepResult::Row => {
                                 // Get the row
-                                let row = stmt.row().unwrap();
+                                let row = stmt.row().ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "row should exist after StepResult::Row".to_string(),
+                                    )
+                                })?;
 
                                 // Extract values from the row
                                 let all_values: Vec<crate::types::Value> =
@@ -1368,7 +1396,7 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1383,30 +1411,21 @@ mod tests {
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns: vec![
-                SchemaColumn {
-                    name: Some("id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: true,
-                    is_rowid_alias: true,
-                    notnull: true,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("name".to_string()),
-                    ty: Type::Text,
-                    ty_str: "TEXT".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
             ],
             has_rowid: true,
             is_strict: false,
@@ -1421,42 +1440,33 @@ mod tests {
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns: vec![
-                SchemaColumn {
-                    name: Some("id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: true,
-                    is_rowid_alias: true,
-                    notnull: true,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("customer_id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("total".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
+                ),
+                SchemaColumn::new(
+                    Some("customer_id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef::default(),
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("total".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
             ],
             has_rowid: true,
             is_strict: false,
@@ -1471,42 +1481,29 @@ mod tests {
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns: vec![
-                SchemaColumn {
-                    name: Some("id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: true,
-                    is_rowid_alias: true,
-                    notnull: true,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("name".to_string()),
-                    ty: Type::Text,
-                    ty_str: "TEXT".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("price".to_string()),
-                    ty: Type::Real,
-                    ty_str: "REAL".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
+                SchemaColumn::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
+                    None,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
+                ),
+                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new(
+                    Some("price".to_string()),
+                    "REAL".to_string(),
+                    None,
+                    Type::Real,
+                    None,
+                    ColDef::default(),
+                ),
             ],
             has_rowid: true,
             is_strict: false,
@@ -1521,42 +1518,24 @@ mod tests {
             root_page: 5,
             primary_key_columns: vec![], // No primary key, so no rowid alias
             columns: vec![
-                SchemaColumn {
-                    name: Some("message".to_string()),
-                    ty: Type::Text,
-                    ty_str: "TEXT".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("level".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("timestamp".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
+                SchemaColumn::new(
+                    Some("message".to_string()),
+                    "TEXT".to_string(),
+                    None,
+                    Type::Text,
+                    None,
+                    ColDef::default(),
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("level".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("timestamp".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
             ],
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,

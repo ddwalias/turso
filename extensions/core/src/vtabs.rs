@@ -28,6 +28,10 @@ pub struct VTabModuleImpl {
     pub rowid: VtabRowIDFn,
     pub destroy: VtabFnDestroy,
     pub best_idx: BestIdxFn,
+    pub begin: VtabBegin,
+    pub commit: VtabCommit,
+    pub rollback: VtabRollback,
+    pub rename: VtabRename,
 }
 
 // SAFETY: VTabModuleImpl contains function pointers and a name pointer that are
@@ -108,6 +112,12 @@ pub type VtabFnUpdate = unsafe extern "C" fn(
 
 pub type VtabFnDestroy = unsafe extern "C" fn(table: *const c_void) -> ResultCode;
 
+pub type VtabBegin = unsafe extern "C" fn(table: *mut c_void) -> ResultCode;
+pub type VtabCommit = unsafe extern "C" fn(table: *mut c_void) -> ResultCode;
+pub type VtabRollback = unsafe extern "C" fn(table: *mut c_void) -> ResultCode;
+pub type VtabRename =
+    unsafe extern "C" fn(table: *mut c_void, new_name: *const c_char) -> ResultCode;
+
 pub type BestIdxFn = unsafe extern "C" fn(
     constraints: *const ConstraintInfo,
     constraint_len: i32,
@@ -140,7 +150,19 @@ pub trait VTable {
     /// 'conn' is an Option to allow for testing. Otherwise a valid connection to the core database
     /// that created the virtual table will be available to use in your extension here.
     fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error>;
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn rollback(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn update(&mut self, _rowid: i64, _args: &[Value]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn rename(&mut self, _new_name: &str) -> Result<(), Self::Error> {
         Ok(())
     }
     fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
@@ -277,7 +299,8 @@ impl IndexInfo {
         let idx_str_len = self.idx_str.as_ref().map(|s| s.len()).unwrap_or(0);
         let c_idx_str = self
             .idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap().into_raw())
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut());
         ExtIndexInfo {
             code: ResultCode::OK,
@@ -689,7 +712,11 @@ impl Stmt {
         let slice = unsafe { std::slice::from_raw_parts(col_names, count_value as usize) };
         for x in slice {
             let name = unsafe { CStr::from_ptr(*x) };
-            names.push(name.to_str().unwrap().to_string());
+            names.push(
+                name.to_str()
+                    .expect("column name should be valid UTF-8")
+                    .to_string(),
+            );
         }
         unsafe { free_column_names(col_names, count_value) };
         names

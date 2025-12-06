@@ -1,22 +1,23 @@
 use turso_parser::ast::SortOrder;
 
+use parking_lot::RwLock;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
-use std::sync::{atomic, Arc, RwLock};
+use std::sync::{atomic, Arc};
 use tempfile;
 
 use crate::types::IOCompletions;
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, File, OpenFlags, IO},
+    io::{Buffer, Completion, CompletionGroup, File, OpenFlags, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
     Result,
 };
-use crate::{io_yield_many, io_yield_one, return_if_io, CompletionError};
+use crate::{io_yield_one, return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -86,7 +87,6 @@ pub struct Sorter {
     insert_state: InsertState,
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
-    seq_count: i64,
     pending_completions: Vec<Completion>,
 }
 
@@ -125,7 +125,6 @@ impl Sorter {
             sort_state: SortState::Start,
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
-            seq_count: 0,
             pending_completions: Vec::new(),
         }
     }
@@ -136,21 +135,6 @@ impl Sorter {
 
     pub fn has_more(&self) -> bool {
         self.current.is_some()
-    }
-
-    /// Get current sequence count and increment it
-    pub fn next_sequence(&mut self) -> i64 {
-        let current = self.seq_count;
-        self.seq_count += 1;
-        current
-    }
-
-    /// Test if at beginning of sequence (count == 0) and increment
-    /// Returns true if this was the first call (seq_count was 0)
-    pub fn seq_beginning(&mut self) -> bool {
-        let was_zero = self.seq_count == 0;
-        self.seq_count += 1;
-        was_zero
     }
 
     // We do the sorting here since this is what is called by the SorterSort instruction
@@ -175,10 +159,7 @@ impl Sorter {
                 SortState::InitHeap => {
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
-                            matches!(
-                                *chunk.io_state.read().unwrap(),
-                                SortedChunkIOState::WaitingForWrite
-                            )
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
                         }),
                         "chunks should been written"
                     );
@@ -252,52 +233,57 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
+                let mut group = CompletionGroup::new(|_| {});
                 for chunk in self.chunks.iter_mut() {
                     match chunk.read() {
                         Err(e) => {
                             tracing::error!("Failed to read chunk: {e}");
-                            self.io.cancel(&completions)?;
+                            group.cancel();
                             self.io.drain()?;
                             return Err(e);
                         }
-                        Ok(c) => completions.push(c),
+                        Ok(c) => group.add(&c),
                     };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                io_yield_many!(completions);
+                let completion = group.build();
+                io_yield_one!(completion);
             }
             InitChunkHeapState::PushChunk => {
                 // Make sure all chunks read at least one record into their buffer.
                 turso_assert!(
                     !self.chunks.iter().any(|chunk| matches!(
-                        *chunk.io_state.read().unwrap(),
+                        *chunk.io_state.read(),
                         SortedChunkIOState::WaitingForRead
                     )),
                     "chunks should have been read"
                 );
                 self.chunk_heap.reserve(self.chunks.len());
                 // TODO: blocking will be unnecessary here with IO completions
-                let mut completions = vec![];
+                let mut group = CompletionGroup::new(|_| {});
                 for chunk_idx in 0..self.chunks.len() {
                     if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
-                        completions.push(c);
+                        group.add(&c);
                     };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
-                if !completions.is_empty() {
-                    io_yield_many!(completions);
+                let completion = group.build();
+                if completion.finished() {
+                    Ok(IOResult::Done(()))
+                } else {
+                    io_yield_one!(completion);
                 }
-                Ok(IOResult::Done(()))
             }
         }
     }
 
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
         if !self.pending_completions.is_empty() {
-            return Ok(IOResult::IO(IOCompletions::Many(
-                self.pending_completions.drain(..).collect(),
-            )));
+            let mut group = CompletionGroup::new(|_| {});
+            for c in self.pending_completions.drain(..) {
+                group.add(&c);
+            }
+            return Ok(IOResult::IO(IOCompletions::Single(group.build())));
         }
         // Make sure all chunks read at least one record into their buffer.
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
@@ -344,11 +330,12 @@ impl Sorter {
             None => {
                 let temp_dir = tempfile::tempdir()?;
                 let chunk_file_path = temp_dir.as_ref().join("chunk_file");
-                let chunk_file = self.io.open_file(
-                    chunk_file_path.to_str().unwrap(),
-                    OpenFlags::Create,
-                    false,
-                )?;
+                let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
+                    LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+                })?;
+                let chunk_file =
+                    self.io
+                        .open_file(chunk_file_path_str, OpenFlags::Create, false)?;
                 self.temp_file = Some(TempFile {
                     _temp_dir: temp_dir,
                     file: chunk_file.clone(),
@@ -450,7 +437,7 @@ impl SortedChunk {
                     }
 
                     if self.records.is_empty() {
-                        let mut buffer_ref = self.buffer.write().unwrap();
+                        let mut buffer_ref = self.buffer.write();
                         let buffer = buffer_ref.as_mut_slice();
                         let mut buffer_offset = 0;
                         while buffer_offset < buffer_len {
@@ -461,8 +448,7 @@ impl SortedChunk {
                                         (record_size as usize, bytes_read)
                                     }
                                     Err(LimboError::Corrupt(_))
-                                        if *self.io_state.read().unwrap()
-                                            != SortedChunkIOState::ReadEOF =>
+                                        if *self.io_state.read() != SortedChunkIOState::ReadEOF =>
                                     {
                                         // Failed to decode a partial varint.
                                         break;
@@ -472,7 +458,7 @@ impl SortedChunk {
                                     }
                                 };
                             if record_size > buffer_len - (buffer_offset + bytes_read) {
-                                if *self.io_state.read().unwrap() == SortedChunkIOState::ReadEOF {
+                                if *self.io_state.read() == SortedChunkIOState::ReadEOF {
                                     crate::bail_corrupt_error!("Incomplete record");
                                 }
                                 break;
@@ -501,13 +487,13 @@ impl SortedChunk {
                     self.next_state = NextState::Finish;
                     // This check is done to see if we need to read more from the chunk before popping the record
                     if self.records.len() == 1
-                        && *self.io_state.read().unwrap() != SortedChunkIOState::ReadEOF
+                        && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
                         // We've consumed the last record. Read more payload into the buffer.
                         if self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst)
                             == 0
                         {
-                            *self.io_state.write().unwrap() = SortedChunkIOState::ReadEOF;
+                            *self.io_state.write() = SortedChunkIOState::ReadEOF;
                         } else {
                             let c = self.read()?;
                             if !c.succeeded() {
@@ -525,9 +511,9 @@ impl SortedChunk {
     }
 
     fn read(&mut self) -> Result<Completion> {
-        *self.io_state.write().unwrap() = SortedChunkIOState::WaitingForRead;
+        *self.io_state.write() = SortedChunkIOState::WaitingForRead;
 
-        let read_buffer_size = self.buffer.read().unwrap().len() - self.buffer_len();
+        let read_buffer_size = self.buffer.read().len() - self.buffer_len();
         let read_buffer_size = read_buffer_size
             .min(self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst));
 
@@ -547,12 +533,12 @@ impl SortedChunk {
 
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
-                *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::ReadEOF;
+                *chunk_io_state_copy.write() = SortedChunkIOState::ReadEOF;
                 return;
             }
-            *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::ReadComplete;
+            *chunk_io_state_copy.write() = SortedChunkIOState::ReadComplete;
 
-            let mut stored_buf_ref = stored_buffer_copy.write().unwrap();
+            let mut stored_buf_ref = stored_buffer_copy.write();
             let stored_buf = stored_buf_ref.as_mut_slice();
             let mut stored_buf_len = stored_buffer_len_copy.load(atomic::Ordering::SeqCst);
 
@@ -578,8 +564,8 @@ impl SortedChunk {
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
-        assert!(*self.io_state.read().unwrap() == SortedChunkIOState::None);
-        *self.io_state.write().unwrap() = SortedChunkIOState::WaitingForWrite;
+        assert!(*self.io_state.read() == SortedChunkIOState::None);
+        *self.io_state.write() = SortedChunkIOState::WaitingForWrite;
         self.chunk_size = chunk_size;
 
         let buffer = Buffer::new_temporary(self.chunk_size);
@@ -604,7 +590,7 @@ impl SortedChunk {
             let Ok(bytes_written) = res else {
                 return;
             };
-            *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::WriteComplete;
+            *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
@@ -692,12 +678,13 @@ impl Ord for SortableImmutableRecord {
             let collation = self.index_key_info[i].collation;
 
             let cmp = match (this_key_value, other_key_value) {
-                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
+                (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(
                     // SAFETY: these were checked to be valid UTF-8 on construction.
-                    unsafe { std::str::from_utf8_unchecked(left) },
-                    unsafe { std::str::from_utf8_unchecked(right) },
+                    &left, &right,
                 ),
-                _ => this_key_value.partial_cmp(&other_key_value).unwrap(),
+                _ => this_key_value
+                    .partial_cmp(&other_key_value)
+                    .expect("sorter values of the same column should be comparable"),
             };
             if !cmp.is_eq() {
                 return match column_order {

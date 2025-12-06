@@ -1,17 +1,21 @@
 use crate::schema::{Schema, Table};
 use crate::translate::emitter::{emit_program, Resolver};
+use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{DeletePlan, Operation, Plan};
+use crate::translate::plan::{
+    DeletePlan, IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination,
+    ResultSetColumn, Scan, SelectPlan,
+};
 use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use std::sync::Arc;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn};
+use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
@@ -36,25 +40,41 @@ pub fn translate_delete(
         );
     }
 
-    // FIXME: SQLite's delete using Returning is complex. It scans the table in read mode first, building
-    // the result set, and only after that it opens the table for writing and deletes the rows. It
-    // also uses a couple of instructions that we don't implement yet (i.e.: RowSetAdd, RowSetRead,
-    // RowSetTest). So for now I'll just defer it altogether.
-    if !returning.is_empty() {
-        crate::bail_parse_error!("RETURNING currently not implemented for DELETE statements.");
-    }
-    let result_columns = vec![];
-
     let mut delete_plan = prepare_delete_plan(
         &mut program,
         resolver.schema,
         tbl_name,
         where_clause,
         limit,
-        result_columns,
+        returning,
         connection,
     )?;
-    optimize_plan(&mut delete_plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
+    if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
+        // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
+        // are present), so the joined table is treated as a plain table scan again.
+        //
+        // RowSets re-seek the base table cursor for every delete, so expressions that reference
+        // columns during index maintenance must bind to the table cursor again (not the index we
+        // originally used to find the rowids).
+        //
+        // e.g. DELETE using idx_x gathers rowids, but BEFORE DELETE trigger causes re-seek on
+        // table, so expression indexes must read from that table cursor.
+        if delete_plan_inner.rowset_plan.is_some() {
+            if let Some(joined_table) = delete_plan_inner
+                .table_references
+                .joined_tables_mut()
+                .first_mut()
+            {
+                if matches!(joined_table.table, Table::BTree(_)) {
+                    joined_table.op = Operation::Scan(Scan::BTreeTable {
+                        iter_dir: IterationDirection::Forwards,
+                        index: None,
+                    });
+                }
+            }
+        }
+    }
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
@@ -74,7 +94,7 @@ pub fn prepare_delete_plan(
     tbl_name: String,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
-    result_columns: Vec<super::plan::ResultSetColumn>,
+    mut returning: Vec<ResultColumn>,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let table = match schema.get_table(&tbl_name) {
@@ -101,6 +121,8 @@ pub fn prepare_delete_plan(
         );
     }
 
+    let btree_table_for_triggers = table.btree();
+
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {
@@ -116,6 +138,8 @@ pub fn prepare_delete_plan(
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
@@ -129,26 +153,93 @@ pub fn prepare_delete_plan(
         None,
         &mut where_predicates,
         connection,
-        &mut program.param_ctx,
     )?;
 
+    let result_columns =
+        process_returning_clause(&mut returning, &mut table_references, connection)?;
+
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |mut l| {
-        parse_limit(&mut l, connection, &mut program.param_ctx)
-    })?;
+    let (resolved_limit, resolved_offset) =
+        limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
-    let plan = DeletePlan {
-        table_references,
-        result_columns,
-        where_clause: where_predicates,
-        order_by: vec![],
-        limit: resolved_limit,
-        offset: resolved_offset,
-        contains_constant_false_condition: false,
-        indexes,
-    };
+    // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
+    // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
+    // on the target table -- presumably due to lack of static analysis capabilities to determine whether it's safe
+    // to skip the rowset materialization.
+    let has_delete_triggers = btree_table_for_triggers
+        .as_ref()
+        .map(|bt| has_relevant_triggers_type_only(schema, TriggerEvent::Delete, None, bt))
+        .unwrap_or(false);
 
-    Ok(Plan::Delete(plan))
+    if has_delete_triggers {
+        // Create a SelectPlan that materializes rowids into a RowSet
+        let rowid_internal_id = table_references
+            .joined_tables()
+            .first()
+            .unwrap()
+            .internal_id;
+        let rowset_reg = program.alloc_register();
+
+        let rowset_plan = SelectPlan {
+            table_references: table_references.clone(),
+            result_columns: vec![ResultSetColumn {
+                expr: Expr::RowId {
+                    database: None,
+                    table: rowid_internal_id,
+                },
+                alias: None,
+                contains_aggregates: false,
+            }],
+            where_clause: where_predicates,
+            group_by: None,
+            order_by: vec![],
+            aggregates: vec![],
+            limit: resolved_limit,
+            query_destination: QueryDestination::RowSet { rowset_reg },
+            join_order: table_references
+                .joined_tables()
+                .iter()
+                .enumerate()
+                .map(|(i, t)| JoinOrderMember {
+                    table_id: t.internal_id,
+                    original_idx: i,
+                    is_outer: false,
+                })
+                .collect(),
+            offset: resolved_offset,
+            contains_constant_false_condition: false,
+            distinctness: super::plan::Distinctness::NonDistinct,
+            values: vec![],
+            window: None,
+            non_from_clause_subqueries: vec![],
+        };
+
+        Ok(Plan::Delete(DeletePlan {
+            table_references,
+            result_columns,
+            where_clause: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            contains_constant_false_condition: false,
+            indexes,
+            rowset_plan: Some(rowset_plan),
+            rowset_reg: Some(rowset_reg),
+        }))
+    } else {
+        Ok(Plan::Delete(DeletePlan {
+            table_references,
+            result_columns,
+            where_clause: where_predicates,
+            order_by: vec![],
+            limit: resolved_limit,
+            offset: resolved_offset,
+            contains_constant_false_condition: false,
+            indexes,
+            rowset_plan: None,
+            rowset_reg: None,
+        }))
+    }
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {

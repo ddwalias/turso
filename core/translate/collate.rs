@@ -19,14 +19,13 @@ use crate::{
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
+#[repr(u8)]
 pub enum CollationSeq {
-    /// Standard String compare
+    Unset = 0,
     #[default]
-    Binary,
-    /// Ascii case insensitive
-    NoCase,
-    /// Same as Binary but with trimmed whitespace
-    Rtrim,
+    Binary = 1,
+    NoCase = 2,
+    Rtrim = 3,
 }
 
 impl CollationSeq {
@@ -35,11 +34,20 @@ impl CollationSeq {
             crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
         })
     }
+    #[inline]
+    /// Returns the collation, defaulting to BINARY if unset
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits {
+            2 => CollationSeq::NoCase,
+            3 => CollationSeq::Rtrim,
+            _ => CollationSeq::Binary,
+        }
+    }
 
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
         match self {
-            CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
+            CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
             CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
             CollationSeq::Rtrim => Self::rtrim_cmp(lhs, rhs),
         }
@@ -105,25 +113,25 @@ pub fn get_collseq_from_expr(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                let table_ref = referenced_tables
+                let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
                 let column = table_ref
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
                 if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation;
+                    maybe_column_collseq = column.collation_opt();
                 }
                 return Ok(WalkControl::Continue);
             }
             Expr::RowId { table, .. } => {
-                let table_ref = referenced_tables
+                let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation;
+                            maybe_column_collseq = rowid_alias_col.collation_opt();
                         }
                     }
                 }
@@ -144,7 +152,7 @@ mod tests {
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeTable, Column, Table, Type},
+        schema::{BTreeTable, ColDef, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
     };
 
@@ -343,38 +351,37 @@ mod tests {
         collation: Option<CollationSeq>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
+        let table = Table::BTree(Arc::new(BTreeTable {
+            root_page: 0,
+            has_autoincrement: false,
+            has_rowid: false,
+            is_strict: false,
+            name: "foo".to_string(),
+            primary_key_columns: vec![],
+            columns: vec![Column::new(
+                Some("foo".to_string()),
+                "text".to_string(),
+                None,
+                Type::Text,
+                collation,
+                ColDef::default(),
+            )],
+            unique_sets: vec![],
+            foreign_keys: vec![],
+        }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "foo".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: false,
-                is_strict: false,
-                name: "foo".to_string(),
-                primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("foo".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation,
-                    hidden: false,
-                }],
-                unique_sets: vec![],
-                foreign_keys: vec![],
-            })),
+            table,
         });
 
         table_references
@@ -392,6 +399,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "t1".to_string(),
             internal_id: TableInternalId::from(1),
@@ -403,18 +412,14 @@ mod tests {
                 is_strict: false,
                 name: "t1".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("a".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: left,
-                    hidden: false,
-                }],
+                columns: vec![Column::new(
+                    Some("a".to_string()),
+                    "text".to_string(),
+                    None,
+                    Type::Text,
+                    left,
+                    ColDef::default(),
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),
@@ -426,6 +431,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "t2".to_string(),
             internal_id: TableInternalId::from(2),
@@ -437,18 +444,14 @@ mod tests {
                 is_strict: false,
                 name: "t2".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("b".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: right,
-                    hidden: false,
-                }],
+                columns: vec![Column::new(
+                    Some("b".to_string()),
+                    "text".to_string(),
+                    None,
+                    Type::Text,
+                    right,
+                    ColDef::default(),
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),
@@ -467,6 +470,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
@@ -478,18 +483,20 @@ mod tests {
                 is_strict: false,
                 name: "bar".to_string(),
                 primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
-                columns: vec![Column {
-                    name: Some("id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: true,
-                    is_rowid_alias: true,
-                    notnull: false,
-                    default: None,
-                    unique: true,
+                columns: vec![Column::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
                     collation,
-                    hidden: false,
-                }],
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: false,
+                        unique: true,
+                        hidden: false,
+                    },
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),

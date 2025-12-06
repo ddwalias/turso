@@ -31,6 +31,7 @@ jobs:
           name: turso
           tool: criterion
           output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
@@ -38,8 +39,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -51,8 +52,7 @@ jobs:
 
           # parameters of the algorithm. Note: These are global, so we only set them once and for all.
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.0001
-          # Ignore changes smaller than this.
+          nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
 
   clickbench:
@@ -73,14 +73,15 @@ jobs:
           name: clickbench/turso
           tool: time
           output-file-path: clickbench-tursodb.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
           # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -89,6 +90,8 @@ jobs:
           never-fail: true
           # Make results and change points public, so that any oss contributor can see them
           nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
 
       - name: Analyze SQLITE3 result with Nyrkiö
         uses: nyrkio/change-detection@HEAD
@@ -96,12 +99,15 @@ jobs:
           name: clickbench/sqlite3
           tool: time
           output-file-path: clickbench-sqlite3.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           fail-on-alert: false
-          comment-on-alert: true
+          comment-on-alert: false
           comment-always: false
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
           never-fail: true
           nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
 
   tpc-h-criterion:
     runs-on: ubuntu-latest
@@ -134,6 +140,7 @@ jobs:
           name: tpc-h
           tool: criterion
           output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
@@ -141,8 +148,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -154,8 +161,7 @@ jobs:
 
           # parameters of the algorithm. Note: These are global, so we only set them once and for all.
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.0001
-          # Ignore changes smaller than this.
+          nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
 
   tpc-h:

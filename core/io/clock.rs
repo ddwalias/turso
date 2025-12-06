@@ -72,7 +72,8 @@ impl std::ops::Add<Duration> for Instant {
     type Output = Instant;
 
     fn add(self, rhs: Duration) -> Self::Output {
-        self.checked_add_duration(&rhs).unwrap()
+        self.checked_add_duration(&rhs)
+            .expect("duration addition overflow")
     }
 }
 
@@ -80,10 +81,23 @@ impl std::ops::Sub<Duration> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: Duration) -> Self::Output {
-        self.checked_sub_duration(&rhs).unwrap()
+        self.checked_sub_duration(&rhs)
+            .expect("duration subtraction underflow")
     }
 }
 
 pub trait Clock {
     fn now(&self) -> Instant;
+}
+
+pub struct DefaultClock;
+
+impl Clock for DefaultClock {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
+    }
 }

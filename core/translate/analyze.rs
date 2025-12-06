@@ -97,6 +97,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::Delete {
             cursor_id,
             table_name: "sqlite_stat1".to_string(),
+            is_part_of_update: false,
         });
         program.emit_insn(Insn::Next {
             cursor_id,
@@ -160,7 +161,7 @@ pub fn translate_analyze(
         });
     };
 
-    if target_schema.columns().iter().any(|c| c.primary_key) {
+    if target_schema.columns().iter().any(|c| c.primary_key()) {
         bail_parse_error!("ANALYZE on tables with primary key is not supported");
     }
     if !target_btree.has_rowid {

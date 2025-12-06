@@ -1,20 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
+use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
-};
-use crate::translate::optimizer::optimize_select_plan;
-use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
-use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
+    Connection,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -22,8 +19,7 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
-    UpdatePlan,
+    ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
 use super::planner::parse_where;
 /*
@@ -56,13 +52,13 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 18    Goto           0     1     0                    0
 */
 pub fn translate_update(
-    body: &mut ast::Update,
+    body: ast::Update,
     resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -74,7 +70,7 @@ pub fn translate_update(
 }
 
 pub fn translate_update_for_schema_change(
-    body: &mut ast::Update,
+    body: ast::Update,
     resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -89,7 +85,7 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -103,7 +99,7 @@ pub fn translate_update_for_schema_change(
 pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    body: &mut ast::Update,
+    mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
@@ -193,6 +189,8 @@ pub fn prepare_update_plan(
         op: build_scan_op(&table, iter_dir),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
@@ -214,7 +212,6 @@ pub fn prepare_update_plan(
             Some(&mut table_references),
             None,
             connection,
-            &mut program.param_ctx,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
@@ -244,7 +241,7 @@ pub fn prepare_update_plan(
                             .columns()
                             .iter()
                             .enumerate()
-                            .find(|(_i, c)| c.is_rowid_alias)
+                            .find(|(_i, c)| c.is_rowid_alias())
                         {
                             // Use the rowid alias column index
                             match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
@@ -272,13 +269,8 @@ pub fn prepare_update_plan(
         }
     }
 
-    let (result_columns, _table_references) = process_returning_clause(
-        &mut body.returning,
-        &table,
-        body.tbl_name.name.as_str(),
-        program,
-        connection,
-    )?;
+    let result_columns =
+        process_returning_clause(&mut body.returning, &mut table_references, connection)?;
 
     let order_by = body
         .order_by
@@ -289,7 +281,6 @@ pub fn prepare_update_plan(
                 Some(&mut table_references),
                 Some(&result_columns),
                 connection,
-                &mut program.param_ctx,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
@@ -301,125 +292,20 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
-
-    let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || (*idx != ROWID_SENTINEL && columns[*idx].is_rowid_alias)
-    });
-    let direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
-
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used || direct_rowid_update {
-        let mut where_clause = vec![];
-        let internal_id = program.table_reference_counter.next();
-
-        let joined_tables = vec![JoinedTable {
-            table: match table.as_ref() {
-                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-                _ => unreachable!(),
-            },
-            identifier: table_name.to_string(),
-            internal_id,
-            op: build_scan_op(&table, iter_dir),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            database_id: 0,
-        }];
-        let mut table_references = TableReferences::new(joined_tables, vec![]);
-
-        // Parse the WHERE clause
-        parse_where(
-            body.where_clause.as_deref(),
-            &mut table_references,
-            Some(&result_columns),
-            &mut where_clause,
-            connection,
-            &mut program.param_ctx,
-        )?;
-
-        let table = Arc::new(BTreeTable {
-            root_page: 0, // Not relevant for ephemeral table definition
-            name: "ephemeral_scratch".to_string(),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
-            columns: vec![Column {
-                name: Some("rowid".to_string()),
-                ty: Type::Integer,
-                ty_str: "INTEGER".to_string(),
-                primary_key: true,
-                is_rowid_alias: false,
-                notnull: true,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-        });
-
-        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-
-        let mut ephemeral_plan = SelectPlan {
-            table_references,
-            result_columns: vec![ResultSetColumn {
-                expr: Expr::RowId {
-                    database: None,
-                    table: internal_id,
-                },
-                alias: None,
-                contains_aggregates: false,
-            }],
-            where_clause,       // original WHERE terms from the UPDATE clause
-            group_by: None,     // N/A
-            order_by: vec![],   // N/A
-            aggregates: vec![], // N/A
-            limit: None,        // N/A
-            query_destination: QueryDestination::EphemeralTable {
-                cursor_id: temp_cursor_id,
-                table,
-            },
-            join_order: vec![],
-            offset: None,
-            contains_constant_false_condition: false,
-            distinctness: super::plan::Distinctness::NonDistinct,
-            values: vec![],
-            window: None,
-        };
-
-        optimize_select_plan(&mut ephemeral_plan, schema)?;
-        let table = ephemeral_plan
-            .table_references
-            .joined_tables()
-            .first()
-            .unwrap();
-        // We do not need to emit an ephemeral plan if we are not going to loop over the table values
-        if matches!(table.op, Operation::Search(Search::RowidEq { .. })) {
-            (None, vec![])
-        } else {
-            (Some(ephemeral_plan), vec![])
-        }
-    } else {
-        (None, vec![])
-    };
-
-    if ephemeral_plan.is_none() {
-        // Parse the WHERE clause
-        parse_where(
-            body.where_clause.as_deref(),
-            &mut table_references,
-            Some(&result_columns),
-            &mut where_clause,
-            connection,
-            &mut program.param_ctx,
-        )?;
-    };
+    let mut where_clause = vec![];
+    // Parse the WHERE clause
+    parse_where(
+        body.where_clause.as_deref(),
+        &mut table_references,
+        Some(&result_columns),
+        &mut where_clause,
+        connection,
+    )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
-        parse_limit(l, connection, &mut program.param_ctx)
-    })?;
+    let (limit, offset) = body
+        .limit
+        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
@@ -427,7 +313,7 @@ pub fn prepare_update_plan(
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()
@@ -436,15 +322,20 @@ pub fn prepare_update_plan(
         // or if the colunns used in the partial index WHERE clause are being updated
         indexes
             .filter_map(|idx| {
-                let mut needs = idx
-                    .columns
-                    .iter()
-                    .any(|c| updated_cols.contains(&c.pos_in_table));
+                let mut needs = idx.columns.iter().any(|c| {
+                    c.expr.as_ref().map_or_else(
+                        || updated_cols.contains(&c.pos_in_table),
+                        |expr| {
+                            columns_used_by_index_expr(expr, &table_references, connection)
+                                .iter()
+                                .any(|cidx| updated_cols.contains(cidx))
+                        },
+                    )
+                });
 
                 if !needs {
                     if let Some(w) = &idx.where_clause {
                         let mut where_copy = w.as_ref().clone();
-                        let mut param = ParamState::disallow();
                         let mut tr =
                             TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
                         bind_and_rewrite_expr(
@@ -452,7 +343,6 @@ pub fn prepare_update_plan(
                             Some(&mut tr),
                             None,
                             connection,
-                            &mut param,
                             BindingBehavior::ResultColumnsNotAllowed,
                         )
                         .ok()?;
@@ -485,7 +375,7 @@ pub fn prepare_update_plan(
         offset,
         contains_constant_false_condition: false,
         indexes_to_update,
-        ephemeral_plan,
+        ephemeral_plan: None,
         cdc_update_alter_statement: None,
     }))
 }
@@ -513,4 +403,26 @@ fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
         _ => Ok(WalkControl::Continue),
     });
     acc
+}
+
+/// Returns a set of column indices used by an index expression.
+fn columns_used_by_index_expr(
+    expr: &Expr,
+    table_references: &TableReferences,
+    connection: &Arc<Connection>,
+) -> HashSet<usize> {
+    let mut expr_copy = expr.clone();
+    let mut tr = TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
+    if bind_and_rewrite_expr(
+        &mut expr_copy,
+        Some(&mut tr),
+        None,
+        connection,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )
+    .is_err()
+    {
+        return HashSet::new();
+    }
+    collect_cols_used_in_expr(&expr_copy)
 }

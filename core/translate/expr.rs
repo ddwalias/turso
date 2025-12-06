@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, As, Expr, UnaryOperator};
+use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -10,18 +10,22 @@ use super::plan::TableReferences;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{affinity, Affinity, Table, Type};
+use crate::schema::{Table, Type};
+use crate::translate::expression_index::{
+    normalize_expr_for_index_matching, single_table_column_usage,
+};
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::ResultSetColumn;
+use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{Result, Value};
+use crate::{turso_assert, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -31,16 +35,6 @@ pub struct ConditionMetadata {
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
     pub jump_target_when_null: BranchOffset,
-}
-
-/// Container for register locations of values that can be referenced in RETURNING expressions
-pub struct ReturningValueRegisters {
-    /// Register containing the rowid/primary key
-    pub rowid_register: usize,
-    /// Starting register for column values (in column order)
-    pub columns_start_register: usize,
-    /// Number of columns available
-    pub num_columns: usize,
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -106,6 +100,51 @@ macro_rules! expect_arguments_max {
 
         args
     }};
+}
+
+#[inline]
+/// For expression indexes, try to emit code that directly reads the value from the index
+/// under the following conditions:
+/// - The expression only references columns from a single table
+/// - The referenced table has an index whose expression matches the given expression
+///
+/// If an expression index exactly matches the requested expression, we can
+/// fetch the precomputed value from the index key instead of re-evaluating
+/// the expression. That matters for:
+/// - SELECT a/b FROM t with INDEX ON t(a/b) (avoid computing a/b for every row)
+/// - ORDER BY a+b when the index already stores a+b (preserves ordering)
+///
+/// We mut do this check early in translate_expr so downstream translation does
+/// not build redundant bytecode.
+fn try_emit_expression_index_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+) -> Result<bool> {
+    let Some(referenced_tables) = referenced_tables else {
+        return Ok(false);
+    };
+    let Some((table_id, _)) = single_table_column_usage(expr) else {
+        return Ok(false);
+    };
+    let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_id) else {
+        return Ok(false);
+    };
+    let Some(index) = table_reference.op.index() else {
+        return Ok(false);
+    };
+    let normalized = normalize_expr_for_index_matching(expr, table_reference, referenced_tables);
+    let Some(expr_pos) = index.expression_to_index_pos(&normalized) else {
+        return Ok(false);
+    };
+    let Some(cursor_id) =
+        program.resolve_cursor_id_safe(&CursorKey::index(table_id, index.clone()))
+    else {
+        return Ok(false);
+    };
+    program.emit_column_or_rowid(cursor_id, expr_pos, target_register);
+    Ok(true)
 }
 
 macro_rules! expect_arguments_min {
@@ -266,7 +305,10 @@ fn translate_in_list(
         });
     }
 
-    program.resolve_label(label_ok, program.offset());
+    // we don't know exactly what instruction will came next and it's important to chain label to the execution flow rather then exact next instruction
+    // for example, next instruction can be register assignment, which can be moved by optimized to the constant section
+    // in this case, label_ok must be changed accordingly and be re-binded to another instruction followed the current translation unit after constants reording
+    program.preassign_label_to_next_insn(label_ok);
 
     // by default if IN expression is true we just continue to the next instruction
     if condition_metadata.jump_if_condition_is_true {
@@ -288,6 +330,25 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
+        ast::Expr::SubqueryResult { query_type, .. } => match query_type {
+            SubqueryType::Exists { result_reg } => {
+                emit_cond_jump(program, condition_metadata, *result_reg);
+            }
+            SubqueryType::In { .. } => {
+                let result_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+                emit_cond_jump(program, condition_metadata, result_reg);
+            }
+            SubqueryType::RowValue { num_regs, .. } => {
+                if *num_regs != 1 {
+                    // A query like SELECT * FROM t WHERE (SELECT ...) must return a single column.
+                    crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+                }
+                let result_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+                emit_cond_jump(program, condition_metadata, result_reg);
+            }
+        },
         ast::Expr::Register(_) => {
             crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
         }
@@ -592,7 +653,158 @@ pub fn translate_expr(
         return Ok(target_register);
     }
 
+    // At the very start we try to satisfy the expression from an expression index
+    if try_emit_expression_index_value(program, referenced_tables, expr, target_register)? {
+        if let Some(span) = constant_span {
+            program.constant_span_end(span);
+        }
+        return Ok(target_register);
+    }
+
     match expr {
+        ast::Expr::SubqueryResult {
+            lhs,
+            not_in,
+            query_type,
+            ..
+        } => {
+            match query_type {
+                SubqueryType::Exists { result_reg } => {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *result_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                    Ok(target_register)
+                }
+                SubqueryType::In { cursor_id } => {
+                    // jump here when we can definitely skip the row
+                    let label_skip_row = program.allocate_label();
+                    // jump here when we can definitely include the row
+                    let label_include_row = program.allocate_label();
+                    // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+                    let label_null_rewind = program.allocate_label();
+                    let label_null_checks_loop_start = program.allocate_label();
+                    let label_null_checks_next = program.allocate_label();
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target_register,
+                    });
+                    let lhs_columns = match unwrap_parens(lhs.as_ref().unwrap())? {
+                        ast::Expr::Parenthesized(exprs) => {
+                            exprs.iter().map(|e| e.as_ref()).collect()
+                        }
+                        expr => vec![expr],
+                    };
+                    let lhs_column_count = lhs_columns.len();
+                    let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
+                    for (i, lhs_column) in lhs_columns.iter().enumerate() {
+                        translate_expr(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                        if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                            program.emit_insn(Insn::IsNull {
+                                reg: lhs_column_regs_start + i,
+                                target_pc: if *not_in {
+                                    label_null_rewind
+                                } else {
+                                    label_skip_row
+                                },
+                            });
+                        }
+                    }
+                    if *not_in {
+                        // WHERE ... NOT IN (SELECT ...)
+                        // We must skip the row if we find a match.
+                        program.emit_insn(Insn::Found {
+                            cursor_id: *cursor_id,
+                            target_pc: label_skip_row,
+                            record_reg: lhs_column_regs_start,
+                            num_regs: lhs_column_count,
+                        });
+                        // Ok, so Found didn't return a match.
+                        // Because SQL NULL, we need do extra checks to see if we can include the row.
+                        // Consider:
+                        // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
+                        // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
+                        // _Both_ of these queries should return nothing, because... SQL NULL.
+                        // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
+                        // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
+                        // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
+                        // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
+                        //
+                        // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
+                        // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
+                        // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
+                        // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
+                        // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
+                        // in which case we need to NOT include the row.
+                        // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
+                        program.preassign_label_to_next_insn(label_null_rewind);
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id: *cursor_id,
+                            pc_if_empty: label_include_row,
+                        });
+                        program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                        let column_check_reg = program.alloc_register();
+                        for i in 0..lhs_column_count {
+                            program.emit_insn(Insn::Column {
+                                cursor_id: *cursor_id,
+                                column: i,
+                                dest: column_check_reg,
+                                default: None,
+                            });
+                            program.emit_insn(Insn::Ne {
+                                lhs: lhs_column_regs_start + i,
+                                rhs: column_check_reg,
+                                target_pc: label_null_checks_next,
+                                flags: CmpInsFlags::default(),
+                                collation: program.curr_collation(),
+                            });
+                        }
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_skip_row,
+                        });
+                        program.preassign_label_to_next_insn(label_null_checks_next);
+                        program.emit_insn(Insn::Next {
+                            cursor_id: *cursor_id,
+                            pc_if_next: label_null_checks_loop_start,
+                        })
+                    } else {
+                        // WHERE ... IN (SELECT ...)
+                        // We can skip the row if we don't find a match
+                        program.emit_insn(Insn::NotFound {
+                            cursor_id: *cursor_id,
+                            target_pc: label_skip_row,
+                            record_reg: lhs_column_regs_start,
+                            num_regs: lhs_column_count,
+                        });
+                    }
+                    program.preassign_label_to_next_insn(label_include_row);
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: target_register,
+                    });
+                    program.preassign_label_to_next_insn(label_skip_row);
+                    Ok(target_register)
+                }
+                SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                } => {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *result_reg_start,
+                        dst_reg: target_register,
+                        extra_amount: num_regs - 1,
+                    });
+                    Ok(target_register)
+                }
+            }
+        }
         ast::Expr::Between { .. } => {
             unreachable!("expression should have been rewritten in optmizer")
         }
@@ -706,7 +918,7 @@ pub fn translate_expr(
         ast::Expr::Cast { expr, type_name } => {
             let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let type_affinity = affinity(&type_name.name);
+            let type_affinity = Affinity::affinity(&type_name.name);
             program.emit_insn(Insn::Cast {
                 reg: target_register,
                 affinity: type_affinity,
@@ -724,7 +936,9 @@ pub fn translate_expr(
         ast::Expr::DoublyQualified(_, _, _) => {
             crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
         }
-        ast::Expr::Exists(_) => crate::bail_parse_error!("EXISTS in WHERE clause is not supported"),
+        ast::Expr::Exists(_) => {
+            crate::bail_parse_error!("EXISTS is not supported in this position")
+        }
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1934,85 +2148,139 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            let (index, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
+            // When a cursor override is active for this table, we bypass all index logic
+            // and read directly from the override cursor. This is used during hash join
+            // build phases where we iterate using a separate cursor and don't want to use any index.
+            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+
+            let (index, index_method, use_covering_index) = {
+                if has_cursor_override {
+                    (None, None, false)
+                } else if let Some(table_reference) = referenced_tables
+                    .expect("table_references needed translating Expr::Column")
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
+                        if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
+                            Some(index_method)
+                        } else {
+                            None
+                        },
                         table_reference.utilizes_covering_index(),
                     )
                 } else {
-                    (None, false)
+                    (None, None, false)
                 }
             };
+            let use_index_method = index_method.and_then(|m| m.covered_columns.get(column));
 
-            let table = referenced_tables
+            let (is_from_outer_query_scope, table) = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
-                .expect("table reference should be found");
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "table reference should be found: {} (referenced_tables: {:?})",
+                        table_ref_id, referenced_tables
+                    )
+                });
 
-            let Some(table_column) = table.get_column_at(*column) else {
-                crate::bail_parse_error!("column index out of bounds");
-            };
-            // Counter intuitive but a column always needs to have a collation
-            program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            if use_index_method.is_none() {
+                let Some(table_column) = table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+                // Counter intuitive but a column always needs to have a collation
+                program.set_collation(Some((table_column.collation(), false)));
+            }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
             // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
             match &table {
                 Table::BTree(_) => {
-                    let table_cursor_id = if use_covering_index {
-                        None
-                    } else {
-                        Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
-                    };
-                    let index_cursor_id = index.map(|index| {
-                        program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
-                    });
-                    if *is_rowid_alias {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::IdxRowId {
-                                cursor_id: index_cursor_id,
-                                dest: target_register,
-                            });
-                        } else if let Some(table_cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::RowId {
-                                cursor_id: table_cursor_id,
-                                dest: target_register,
-                            });
+                    let (table_cursor_id, index_cursor_id) = if is_from_outer_query_scope {
+                        // Due to a limitation of our translation system, a subquery that references an outer query table
+                        // cannot know whether a table cursor, index cursor, or both were opened for that table reference.
+                        // Hence: currently we first try to resolve a table cursor, and if that fails,
+                        // we resolve an index cursor.
+                        if let Some(table_cursor_id) =
+                            program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
+                        {
+                            (Some(table_cursor_id), None)
                         } else {
-                            unreachable!("Either index or table cursor must be opened");
+                            (
+                                None,
+                                Some(program.resolve_any_index_cursor_id_for_table(*table_ref_id)),
+                            )
                         }
                     } else {
-                        let read_cursor = if use_covering_index {
-                            index_cursor_id.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            )
+                        let table_cursor_id = if use_covering_index || use_index_method.is_some() {
+                            None
                         } else {
-                            table_cursor_id.expect(
-                                "table cursor should be opened when use_covering_index=false",
-                            )
+                            Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
                         };
-                        let column = if use_covering_index {
-                            let index = index.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            );
-                            index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
-                                    })
-                        } else {
-                            *column
-                        };
-
-                        program.emit_column_or_rowid(read_cursor, column, target_register);
-                    }
-                    let Some(column) = table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
+                        let index_cursor_id = index.map(|index| {
+                            program
+                                .resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
+                        });
+                        (table_cursor_id, index_cursor_id)
                     };
-                    maybe_apply_affinity(column.ty, target_register, program);
+
+                    if let Some(custom_module_column) = use_index_method {
+                        program.emit_column_or_rowid(
+                            index_cursor_id.unwrap(),
+                            *custom_module_column,
+                            target_register,
+                        );
+                    } else {
+                        if *is_rowid_alias {
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                program.emit_insn(Insn::IdxRowId {
+                                    cursor_id: index_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else if let Some(table_cursor_id) = table_cursor_id {
+                                program.emit_insn(Insn::RowId {
+                                    cursor_id: table_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else {
+                                unreachable!("Either index or table cursor must be opened");
+                            }
+                        } else {
+                            let read_from_index = if is_from_outer_query_scope {
+                                index_cursor_id.is_some()
+                            } else {
+                                use_covering_index
+                            };
+                            let read_cursor = if read_from_index {
+                                index_cursor_id.expect("index cursor should be opened")
+                            } else {
+                                table_cursor_id.expect("table cursor should be opened")
+                            };
+                            let column = if read_from_index {
+                                let index = program.resolve_index_for_cursor_id(
+                                    index_cursor_id.expect("index cursor should be opened"),
+                                );
+                                index
+                                    .column_table_pos_to_index_pos(*column)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                        "index {} does not contain column number {} of table {}",
+                                        index.name, column, table_ref_id
+                                    )
+                                    })
+                            } else {
+                                *column
+                            };
+
+                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                        }
+                        let Some(column) = table.get_column_at(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        maybe_apply_affinity(column.ty(), target_register, program);
+                    }
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
@@ -2137,10 +2405,10 @@ pub fn translate_expr(
             Ok(result_reg)
         }
         ast::Expr::InSelect { .. } => {
-            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported")
+            crate::bail_parse_error!("IN (...subquery) is not supported in this position")
         }
         ast::Expr::InTable { .. } => {
-            crate::bail_parse_error!("Table expression in WHERE clause is not supported")
+            crate::bail_parse_error!("Table expression is not supported in this position")
         }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2178,7 +2446,7 @@ pub fn translate_expr(
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => {
-            crate::bail_parse_error!("ast::Expr::Name in WHERE clause is not supported")
+            crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
         }
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
@@ -2225,7 +2493,7 @@ pub fn translate_expr(
         }
         ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
         ast::Expr::Subquery(_) => {
-            crate::bail_parse_error!("Subquery in WHERE clause is not supported")
+            crate::bail_parse_error!("Subquery is not supported in this position")
         }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
@@ -3135,12 +3403,12 @@ pub fn as_binary_components(
 
 /// Recursively unwrap parentheses from an expression
 /// e.g. (((t.x > 5))) -> t.x > 5
-fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
+pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     match expr {
         ast::Expr::Column { .. } => Ok(expr),
         ast::Expr::Parenthesized(exprs) => match exprs.len() {
             1 => unwrap_parens(exprs.first().unwrap()),
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
+            _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.
         },
         _ => Ok(expr),
     }
@@ -3177,6 +3445,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {
@@ -3347,28 +3620,6 @@ where
     Ok(WalkControl::Continue)
 }
 
-pub struct ParamState {
-    // flag which allow or forbid usage of parameters during translation of AST to the program
-    //
-    // for example, parameters are not allowed in the partial index definition
-    // so tursodb set allowed to false when it parsed WHERE clause of partial index definition
-    pub allowed: bool,
-}
-
-impl Default for ParamState {
-    fn default() -> Self {
-        Self { allowed: true }
-    }
-}
-impl ParamState {
-    pub fn is_valid(&self) -> bool {
-        self.allowed
-    }
-    pub fn disallow() -> Self {
-        Self { allowed: false }
-    }
-}
-
 /// The precedence of binding identifiers to columns.
 ///
 /// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
@@ -3394,18 +3645,12 @@ pub fn bind_and_rewrite_expr<'a>(
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     connection: &'a Arc<crate::Connection>,
-    param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
-) -> Result<WalkControl> {
+) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Variable(_) => {
-                    if !param_state.is_valid() {
-                        crate::bail_parse_error!("Parameters are not allowed in this context");
-                    }
-                }
                 ast::Expr::Between {
                     lhs,
                     not,
@@ -3431,9 +3676,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
                     };
                 }
-                _ => {}
-            }
-            match expr {
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -3446,12 +3688,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
@@ -3486,18 +3727,22 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     joined_table.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Some(row_id_expr) = parse_row_id(
-                            &normalized_id,
-                            referenced_tables.joined_tables()[0].internal_id,
-                            || referenced_tables.joined_tables().len() != 1,
-                        )? {
-                            *expr = row_id_expr;
-
-                            return Ok(WalkControl::Continue);
+                        } else {
+                            let is_btree_table = matches!(joined_table.table, Table::BTree(_));
+                            if is_btree_table {
+                                if let Some(row_id_expr) = parse_row_id(
+                                    &normalized_id,
+                                    referenced_tables.joined_tables()[0].internal_id,
+                                    || referenced_tables.joined_tables().len() != 1,
+                                )? {
+                                    *expr = row_id_expr;
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
                         }
                     }
 
@@ -3524,7 +3769,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     outer_ref.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         }
@@ -3544,12 +3789,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
@@ -3604,7 +3848,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         database: None, // TODO: support different databases
                         table: tbl_id,
                         column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     };
                     tracing::debug!("rewritten to column");
                     referenced_tables.mark_column_used(tbl_id, col_idx);
@@ -3664,7 +3908,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let col = table.columns().get(col_idx).unwrap();
 
                     // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias;
+                    let is_rowid_alias = col.is_rowid_alias();
 
                     // Convert to Column expression - since this is a cross-database reference,
                     // we need to create a synthetic table reference for it
@@ -3692,7 +3936,8 @@ pub fn bind_and_rewrite_expr<'a>(
             }
             Ok(WalkControl::Continue)
         },
-    )
+    )?;
+    Ok(())
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -3703,6 +3948,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr_mut(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {
@@ -3880,7 +4130,7 @@ pub fn get_expr_affinity(
     match expr {
         ast::Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
-                if let Some(table_ref) = tables.find_table_by_internal_id(*table) {
+                if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
                         return col.affinity();
                     }
@@ -3891,7 +4141,7 @@ pub fn get_expr_affinity(
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                crate::schema::affinity(&type_name.name)
+                Affinity::affinity(&type_name.name)
             } else {
                 Affinity::Blob
             }
@@ -3945,106 +4195,6 @@ pub fn compare_affinity(
             other_affinity
         } else {
             Affinity::Blob
-        }
-    }
-}
-
-/// Evaluate a RETURNING expression using register-based evaluation instead of cursor-based.
-/// This is used for RETURNING clauses where we have register values instead of cursor data.
-pub fn translate_expr_for_returning(
-    program: &mut ProgramBuilder,
-    expr: &Expr,
-    value_registers: &ReturningValueRegisters,
-    target_register: usize,
-) -> Result<usize> {
-    match expr {
-        Expr::Column {
-            column,
-            is_rowid_alias,
-            ..
-        } => {
-            if *is_rowid_alias {
-                // For rowid references, copy from the rowid register
-                program.emit_insn(Insn::Copy {
-                    src_reg: value_registers.rowid_register,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
-            } else {
-                // For regular column references, copy from the appropriate column register
-                let column_idx = *column;
-                if column_idx < value_registers.num_columns {
-                    let column_reg = value_registers.columns_start_register + column_idx;
-                    program.emit_insn(Insn::Copy {
-                        src_reg: column_reg,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                } else {
-                    crate::bail_parse_error!("Column index out of bounds in RETURNING clause");
-                }
-            }
-            Ok(target_register)
-        }
-        Expr::RowId { .. } => {
-            // For ROWID expressions, copy from the rowid register
-            program.emit_insn(Insn::Copy {
-                src_reg: value_registers.rowid_register,
-                dst_reg: target_register,
-                extra_amount: 0,
-            });
-            Ok(target_register)
-        }
-        Expr::Literal(literal) => emit_literal(program, literal, target_register),
-        Expr::Binary(lhs, op, rhs) => {
-            let lhs_reg = program.alloc_register();
-            let rhs_reg = program.alloc_register();
-
-            // Recursively evaluate left-hand side
-            translate_expr_for_returning(program, lhs, value_registers, lhs_reg)?;
-
-            // Recursively evaluate right-hand side
-            translate_expr_for_returning(program, rhs, value_registers, rhs_reg)?;
-
-            // Use the shared emit_binary_insn function
-            emit_binary_insn(
-                program,
-                op,
-                lhs_reg,
-                rhs_reg,
-                target_register,
-                lhs,
-                rhs,
-                None, // No table references needed for RETURNING
-                None, // No condition metadata needed for RETURNING
-            )?;
-
-            Ok(target_register)
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            // Evaluate arguments into registers
-            let mut arg_regs = Vec::new();
-            for arg in args.iter() {
-                let arg_reg = program.alloc_register();
-                translate_expr_for_returning(program, arg, value_registers, arg_reg)?;
-                arg_regs.push(arg_reg);
-            }
-
-            // Resolve and call the function using shared helper
-            let func = Func::resolve_function(name.as_str(), arg_regs.len())?;
-            let func_ctx = FuncCtx {
-                func,
-                arg_count: arg_regs.len(),
-            };
-
-            emit_function_call(program, func_ctx, &arg_regs, target_register)?;
-            Ok(target_register)
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "Unsupported expression type in RETURNING clause: {:?}",
-                expr
-            );
         }
     }
 }
@@ -4110,23 +4260,32 @@ pub fn emit_literal(
         }
         ast::Literal::CurrentDate => {
             program.emit_insn(Insn::String8 {
-                value: datetime::exec_date(&[]).to_string(),
+                value: datetime::exec_date::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
+                    .to_string(),
                 dest: target_register,
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTime => {
             program.emit_insn(Insn::String8 {
-                value: datetime::exec_time(&[]).to_string(),
+                value: datetime::exec_time::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
+                    .to_string(),
                 dest: target_register,
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTimestamp => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_datetime_full(&[]).to_string(),
-                dest: target_register,
-            });
+            program.emit_insn(
+                Insn::String8 {
+                    value: datetime::exec_datetime_full::<
+                        &[_; 0],
+                        std::slice::Iter<'_, Value>,
+                        &Value,
+                    >(&[])
+                    .to_string(),
+                    dest: target_register,
+                },
+            );
             Ok(target_register)
         }
     }
@@ -4160,57 +4319,40 @@ pub fn emit_function_call(
 /// with proper column binding and alias handling.
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
-    table: &Table,
-    table_name: &str,
-    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
     connection: &std::sync::Arc<crate::Connection>,
-) -> Result<(
-    Vec<super::plan::ResultSetColumn>,
-    super::plan::TableReferences,
-)> {
-    use super::plan::{ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences};
+) -> Result<Vec<ResultSetColumn>> {
+    let mut result_columns = Vec::with_capacity(returning.len());
 
-    let mut result_columns = vec![];
-
-    let internal_id = program.table_reference_counter.next();
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: match table {
-                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-                _ => unreachable!(),
-            },
-            identifier: table_name.to_string(),
-            internal_id,
-            op: Operation::default_scan_for(table),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            database_id: 0,
-        }],
-        vec![],
-    );
+    let alias_to_string = |alias: &ast::As| match alias {
+        ast::As::Elided(alias) => alias.as_str().to_string(),
+        ast::As::As(alias) => alias.as_str().to_string(),
+    };
 
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
                 bind_and_rewrite_expr(
                     expr,
-                    Some(&mut table_references),
+                    Some(table_references),
                     None,
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
-                let column_alias = determine_column_alias(expr, alias, table);
-
                 result_columns.push(ResultSetColumn {
-                    expr: *expr.clone(),
-                    alias: column_alias,
+                    expr: expr.as_ref().clone(),
+                    alias: alias.as_ref().map(alias_to_string),
                     contains_aggregates: false,
                 });
             }
             ast::ResultColumn::Star => {
+                let table = table_references
+                    .joined_tables()
+                    .first()
+                    .expect("RETURNING clause must reference at least one table");
+                let internal_id = table.internal_id;
+
                 // Handle RETURNING * by expanding to all table columns
                 // Use the shared internal_id for all columns
                 for (column_index, column) in table.columns().iter().enumerate() {
@@ -4218,7 +4360,7 @@ pub fn process_returning_clause(
                         database: None,
                         table: internal_id,
                         column: column_index,
-                        is_rowid_alias: false,
+                        is_rowid_alias: column.is_rowid_alias(),
                     };
 
                     result_columns.push(ResultSetColumn {
@@ -4228,90 +4370,80 @@ pub fn process_returning_clause(
                     });
                 }
             }
-            ast::ResultColumn::TableStar(_table_name) => {
-                // Handle RETURNING table.* by expanding to all table columns
-                // For single table RETURNING, this is equivalent to *
-                for (column_index, column) in table.columns().iter().enumerate() {
-                    let column_expr = Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: column_index,
-                        is_rowid_alias: false,
-                    };
-
-                    result_columns.push(ResultSetColumn {
-                        expr: column_expr,
-                        alias: column.name.clone(),
-                        contains_aggregates: false,
-                    });
-                }
+            ast::ResultColumn::TableStar(_) => {
+                crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
             }
         }
     }
 
-    Ok((result_columns, table_references))
-}
-
-/// Determine the appropriate alias for a RETURNING column expression
-fn determine_column_alias(
-    expr: &Expr,
-    explicit_alias: &Option<ast::As>,
-    table: &Table,
-) -> Option<String> {
-    // First check for explicit alias
-    if let Some(As::As(name)) = explicit_alias {
-        return Some(name.as_str().to_string());
-    }
-
-    // For ROWID expressions, use "rowid" as the alias
-    if let Expr::RowId { .. } = expr {
-        return Some("rowid".to_string());
-    }
-
-    // For column references, always use the column name from the table
-    if let Expr::Column {
-        column,
-        is_rowid_alias,
-        ..
-    } = expr
-    {
-        if let Some(name) = table
-            .columns()
-            .get(*column)
-            .and_then(|col| col.name.clone())
-        {
-            return Some(name);
-        } else if *is_rowid_alias {
-            // If it's a rowid alias, return "rowid"
-            return Some("rowid".to_string());
-        } else {
-            return None;
-        }
-    }
-
-    // For other expressions, use the expression string representation
-    Some(expr.to_string())
+    Ok(result_columns)
 }
 
 /// Emit bytecode to evaluate RETURNING expressions and produce result rows.
-/// This function handles the actual evaluation of expressions using the values
-/// from the DML operation.
-pub(crate) fn emit_returning_results(
+/// RETURNING result expressions are otherwise evaluated as normal, but the columns of the target table
+/// are added to [Resolver::expr_to_reg_cache], meaning a reference to e.g tbl.col will effectively
+/// refer to a register where the OLD/NEW value of tbl.col is stored after an INSERT/UPDATE/DELETE.
+pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
+    table_references: &TableReferences,
     result_columns: &[super::plan::ResultSetColumn],
-    value_registers: &ReturningValueRegisters,
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    resolver: &mut Resolver<'a>,
 ) -> Result<()> {
     if result_columns.is_empty() {
         return Ok(());
+    }
+
+    turso_assert!(table_references.joined_tables().len() == 1, "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table");
+    let table = table_references.joined_tables().first().unwrap();
+
+    resolver.enable_expr_to_reg_cache();
+    let expr = Expr::RowId {
+        database: None,
+        table: table.internal_id,
+    };
+    let cache_len = resolver.expr_to_reg_cache.len();
+    resolver
+        .expr_to_reg_cache
+        .push((std::borrow::Cow::Owned(expr), rowid_reg));
+    for (i, column) in table.columns().iter().enumerate() {
+        let reg = if column.is_rowid_alias() {
+            rowid_reg
+        } else {
+            reg_columns_start + i
+        };
+        let expr = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: i,
+            is_rowid_alias: column.is_rowid_alias(),
+        };
+        resolver
+            .expr_to_reg_cache
+            .push((std::borrow::Cow::Owned(expr), reg));
     }
 
     let result_start_reg = program.alloc_registers(result_columns.len());
 
     for (i, result_column) in result_columns.iter().enumerate() {
         let reg = result_start_reg + i;
-
-        translate_expr_for_returning(program, &result_column.expr, value_registers, reg)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &result_column.expr,
+            reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
     }
+
+    // Bit of a hack: this is required in case of e.g. INSERT ... ON CONFLICT DO UPDATE ... RETURNING
+    // where the result column values may either be the ones that were inserted, or the ones that were updated,
+    // depending on the row in question.
+    // meaning: emit_returning_results() may be called twice during translation and the cached expression values
+    // must be distinct for each call.
+    resolver.expr_to_reg_cache.truncate(cache_len);
 
     program.emit_insn(Insn::ResultRow {
         start_reg: result_start_reg,
@@ -4319,4 +4451,169 @@ pub(crate) fn emit_returning_results(
     });
 
     Ok(())
+}
+
+/// Get the number of values returned by an expression
+pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
+    Ok(match unwrap_parens(expr)? {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            let evs_left = expr_vector_size(lhs)?;
+            let evs_start = expr_vector_size(start)?;
+            let evs_end = expr_vector_size(end)?;
+            if evs_left != evs_start || evs_left != evs_end {
+                crate::bail_parse_error!("all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})");
+            }
+            1
+        }
+        Expr::Binary(expr, operator, expr1) => {
+            let evs_left = expr_vector_size(expr)?;
+            let evs_right = expr_vector_size(expr1)?;
+            if evs_left != evs_right {
+                crate::bail_parse_error!("all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})");
+            }
+            1
+        }
+        Expr::Register(_) => 1,
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                let evs_base = expr_vector_size(base)?;
+                if evs_base != 1 {
+                    crate::bail_parse_error!(
+                        "base expression in CASE must return 1 value. Got: ({evs_base})"
+                    );
+                }
+            }
+            for (when, then) in when_then_pairs {
+                let evs_when = expr_vector_size(when)?;
+                if evs_when != 1 {
+                    crate::bail_parse_error!(
+                        "when expression in CASE must return 1 value. Got: ({evs_when})"
+                    );
+                }
+                let evs_then = expr_vector_size(then)?;
+                if evs_then != 1 {
+                    crate::bail_parse_error!(
+                        "then expression in CASE must return 1 value. Got: ({evs_then})"
+                    );
+                }
+            }
+            if let Some(else_expr) = else_expr {
+                let evs_else_expr = expr_vector_size(else_expr)?;
+                if evs_else_expr != 1 {
+                    crate::bail_parse_error!(
+                        "else expression in CASE must return 1 value. Got: ({evs_else_expr})"
+                    );
+                }
+            }
+            1
+        }
+        Expr::Cast { expr, .. } => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!("argument to CAST must return 1 value. Got: ({evs_expr})");
+            }
+            1
+        }
+        Expr::Collate(expr, _) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to COLLATE must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::DoublyQualified(..) => 1,
+        Expr::Exists(_) => todo!(),
+        Expr::FunctionCall { name, args, .. } => {
+            for (pos, arg) in args.iter().enumerate() {
+                let evs_arg = expr_vector_size(arg)?;
+                if evs_arg != 1 {
+                    crate::bail_parse_error!(
+                        "argument {} to function call {name} must return 1 value. Got: ({evs_arg})",
+                        pos + 1
+                    );
+                }
+            }
+            1
+        }
+        Expr::FunctionCallStar { .. } => 1,
+        Expr::Id(_) => 1,
+        Expr::Column { .. } => 1,
+        Expr::RowId { .. } => 1,
+        Expr::InList { lhs, rhs, .. } => {
+            let evs_lhs = expr_vector_size(lhs)?;
+            for rhs in rhs.iter() {
+                let evs_rhs = expr_vector_size(rhs)?;
+                if evs_lhs != evs_rhs {
+                    crate::bail_parse_error!("all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})");
+                }
+            }
+            1
+        }
+        Expr::InSelect { .. } => {
+            crate::bail_parse_error!("InSelect is not supported in this position")
+        }
+        Expr::InTable { .. } => {
+            crate::bail_parse_error!("InTable is not supported in this position")
+        }
+        Expr::IsNull(expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to IS NULL must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            let evs_lhs = expr_vector_size(lhs)?;
+            if evs_lhs != 1 {
+                crate::bail_parse_error!(
+                    "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
+                );
+            }
+            let evs_rhs = expr_vector_size(rhs)?;
+            if evs_rhs != 1 {
+                crate::bail_parse_error!(
+                    "right operand of LIKE must return 1 value. Got: ({evs_rhs})"
+                );
+            }
+            1
+        }
+        Expr::Literal(_) => 1,
+        Expr::Name(_) => 1,
+        Expr::NotNull(expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to NOT NULL must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::Parenthesized(exprs) => exprs.len(),
+        Expr::Qualified(..) => 1,
+        Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
+        Expr::Subquery(_) => todo!(),
+        Expr::Unary(unary_operator, expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!("argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})");
+            }
+            1
+        }
+        Expr::Variable(_) => 1,
+        Expr::SubqueryResult { query_type, .. } => match query_type {
+            SubqueryType::Exists { .. } => 1,
+            SubqueryType::In { .. } => 1,
+            SubqueryType::RowValue { num_regs, .. } => *num_regs,
+        },
+    })
 }

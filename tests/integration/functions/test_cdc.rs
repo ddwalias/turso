@@ -14,9 +14,8 @@ fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Val
         .collect()
 }
 
-#[test]
-fn test_cdc_simple_id() {
-    let db = TempDatabase::new_empty(false);
+#[turso_macros::test(mvcc)]
+fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -67,7 +66,7 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
             Value::Null => turso_core::Value::Null,
             Value::Integer(x) => turso_core::Value::Integer(x),
             Value::Real(x) => turso_core::Value::Float(x),
-            Value::Text(x) => turso_core::Value::Text(turso_core::types::Text::new(&x)),
+            Value::Text(x) => turso_core::Value::Text(turso_core::types::Text::new(x)),
             Value::Blob(x) => turso_core::Value::Blob(x),
         })
         .collect::<Vec<_>>();
@@ -76,9 +75,8 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
         .to_vec()
 }
 
-#[test]
-fn test_cdc_simple_before() {
-    let db = TempDatabase::new_empty(false);
+#[turso_macros::test(mvcc)]
+fn test_cdc_simple_before(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -147,9 +145,8 @@ fn test_cdc_simple_before() {
     );
 }
 
-#[test]
-fn test_cdc_simple_after() {
-    let db = TempDatabase::new_empty(false);
+#[turso_macros::test(mvcc)]
+fn test_cdc_simple_after(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -218,9 +215,8 @@ fn test_cdc_simple_after() {
     );
 }
 
-#[test]
-fn test_cdc_simple_full() {
-    let db = TempDatabase::new_empty(false);
+#[turso_macros::test(mvcc)]
+fn test_cdc_simple_full(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -294,9 +290,8 @@ fn test_cdc_simple_full() {
     );
 }
 
-#[test]
-fn test_cdc_crud() {
-    let db = TempDatabase::new_empty(false);
+#[turso_macros::test(mvcc)]
+fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -415,9 +410,9 @@ fn test_cdc_crud() {
     );
 }
 
-#[test]
-fn test_cdc_failed_op() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_failed_op(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
@@ -489,9 +484,9 @@ fn test_cdc_failed_op() {
     );
 }
 
-#[test]
-fn test_cdc_uncaptured_connection() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_uncaptured_connection(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -569,9 +564,9 @@ fn test_cdc_uncaptured_connection() {
     );
 }
 
-#[test]
-fn test_cdc_custom_table() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_custom_table(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -618,9 +613,9 @@ fn test_cdc_custom_table() {
     );
 }
 
-#[test]
-fn test_cdc_ignore_changes_in_cdc_table() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -658,9 +653,9 @@ fn test_cdc_ignore_changes_in_cdc_table() {
     );
 }
 
-#[test]
-fn test_cdc_transaction() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_transaction(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -741,9 +736,9 @@ fn test_cdc_transaction() {
     );
 }
 
-#[test]
-fn test_cdc_independent_connections() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_independent_connections(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
     conn1
@@ -797,9 +792,9 @@ fn test_cdc_independent_connections() {
     );
 }
 
-#[test]
-fn test_cdc_independent_connections_different_cdc_not_ignore() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
     conn1
@@ -887,9 +882,9 @@ fn test_cdc_independent_connections_different_cdc_not_ignore() {
     );
 }
 
-#[test]
-fn test_cdc_table_columns() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_table_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b, c UNIQUE)")
         .unwrap();
@@ -903,9 +898,8 @@ fn test_cdc_table_columns() {
     assert_eq!(rows, vec![vec![Value::Text(r#"["a","c"]"#.to_string())]]);
 }
 
-#[test]
-fn test_cdc_bin_record() {
-    let db = TempDatabase::new_empty(true);
+#[turso_macros::test(mvcc)]
+fn test_cdc_bin_record(db: TempDatabase) {
     let conn = db.connect_limbo();
     let record = record([
         Value::Null,
@@ -932,9 +926,9 @@ fn test_cdc_bin_record() {
     );
 }
 
-#[test]
-fn test_cdc_schema_changes() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_schema_changes(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
@@ -1054,9 +1048,9 @@ fn test_cdc_schema_changes() {
     );
 }
 
-#[test]
-fn test_cdc_schema_changes_alter_table() {
-    let db = TempDatabase::new_empty(true);
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
@@ -1107,9 +1101,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
-                    Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE)".to_string()
-                    )
+                    Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Integer(0),
@@ -1135,9 +1127,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
-                    Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE)".to_string()
-                    )
+                    Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
@@ -1145,7 +1135,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Integer(4),
                     Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE, t)".to_string()
+                        "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
                 ])),
                 Value::Blob(record([

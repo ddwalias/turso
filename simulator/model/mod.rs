@@ -3,12 +3,13 @@ use std::fmt::Display;
 use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
+        pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
@@ -18,6 +19,12 @@ use sql_generation::model::{
 use turso_parser::ast::Distinctness;
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
+
+pub mod interactions;
+pub mod metrics;
+pub mod property;
+
+pub(crate) type ResultSet = turso_core::Result<Vec<Vec<SimValue>>>;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
@@ -34,6 +41,7 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    Pragma(Pragma),
     /// Placeholder query that still needs to be generated
     Placeholder,
 }
@@ -81,8 +89,11 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
-            Query::Placeholder => IndexSet::new(),
+            Query::Begin(_)
+            | Query::Commit(_)
+            | Query::Rollback(_)
+            | Query::Placeholder
+            | Query::Pragma(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -107,6 +118,7 @@ impl Query {
             }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
+            Query::Pragma(_) => vec![],
         }
     }
 
@@ -129,6 +141,11 @@ impl Query {
                 | Self::DropIndex(..)
         )
     }
+
+    #[inline]
+    pub fn is_dml(&self) -> bool {
+        matches!(self, Self::Insert(..) | Self::Update(..) | Self::Delete(..))
+    }
 }
 
 impl Display for Query {
@@ -147,6 +164,7 @@ impl Display for Query {
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
             Self::Placeholder => Ok(()),
+            Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
     }
 }
@@ -169,12 +187,14 @@ impl Shadow for Query {
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
             Query::Placeholder => Ok(vec![]),
+            Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
         }
     }
 }
 
 bitflags! {
     pub struct QueryCapabilities: u32 {
+        const NONE = 0;
         const CREATE = 1 << 0;
         const SELECT = 1 << 1;
         const INSERT = 1 << 2;
@@ -222,12 +242,13 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Placeholder => {
                 unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
+            QueryDiscriminants::Pragma => QueryCapabilities::NONE,
         }
     }
 }
 
 impl QueryDiscriminants {
-    pub const ALL_NO_TRANSACTION: &[QueryDiscriminants] = &[
+    pub const ALL_NO_TRANSACTION: &'_ [QueryDiscriminants] = &[
         QueryDiscriminants::Select,
         QueryDiscriminants::Create,
         QueryDiscriminants::Insert,
@@ -237,6 +258,7 @@ impl QueryDiscriminants {
         QueryDiscriminants::CreateIndex,
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
+        QueryDiscriminants::Pragma,
     ];
 }
 
@@ -312,6 +334,7 @@ impl Shadow for Drop {
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
+    //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
@@ -344,14 +367,30 @@ impl Shadow for Insert {
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let first_table = tables
-            .iter()
-            .find(|t| t.name == self.table)
-            .context("Table not found")?;
-
-        let mut join_table = JoinTable {
-            tables: vec![first_table.clone()],
-            rows: Vec::new(),
+        let mut join_table = match &self.table {
+            SelectTable::Table(table) => {
+                let first_table = tables
+                    .iter()
+                    .find(|t| t.name == *table)
+                    .context("Table not found")?;
+                JoinTable {
+                    tables: vec![first_table.clone()],
+                    rows: first_table.rows.clone(),
+                }
+            }
+            SelectTable::Select(select) => {
+                let select_dependencies = select.dependencies();
+                let result_tables = tables
+                    .iter()
+                    .filter(|shadow_table| select_dependencies.contains(shadow_table.name.as_str()))
+                    .cloned()
+                    .collect();
+                let rows = select.shadow(tables)?;
+                JoinTable {
+                    tables: result_tables,
+                    rows,
+                }
+            }
         };
 
         for join in &self.joins {
@@ -364,29 +403,18 @@ impl Shadow for FromClause {
 
             match join.join_type {
                 JoinType::Inner => {
-                    // Implement inner join logic
-                    let join_rows = joined_table
-                        .rows
-                        .iter()
-                        .filter(|row| join.on.test(row, joined_table))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    // take a cartesian product of the rows
-                    let all_row_pairs = join_table
-                        .rows
-                        .clone()
-                        .into_iter()
-                        .cartesian_product(join_rows.iter());
-
-                    for (row1, row2) in all_row_pairs {
-                        let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
-
-                        let is_in = join.on.test(&row, &join_table);
-
-                        if is_in {
-                            join_table.rows.push(row);
+                    let prev_rows = std::mem::take(&mut join_table.rows);
+                    let mut new_rows = Vec::new();
+                    for row1 in prev_rows.into_iter() {
+                        for row2 in joined_table.rows.iter() {
+                            let combined_row =
+                                row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
+                            if join.on.test(&combined_row, &join_table) {
+                                new_rows.push(combined_row);
+                            }
                         }
                     }
+                    join_table.rows = new_rows;
                 }
                 _ => todo!(),
             }

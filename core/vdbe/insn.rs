@@ -5,12 +5,14 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{Affinity, BTreeTable, Column, Index},
+    schema::{BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
-    Value,
+    vdbe::affinity::Affinity,
+    Statement, Value,
 };
+use parking_lot::RwLock;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
@@ -112,6 +114,7 @@ pub struct InsertFlags(pub u8);
 impl InsertFlags {
     pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
+    pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -128,6 +131,11 @@ impl InsertFlags {
 
     pub fn update_rowid_change(mut self) -> Self {
         self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
+        self
+    }
+
+    pub fn is_ephemeral_table_insert(mut self) -> Self {
+        self.0 |= InsertFlags::EPHEMERAL_TABLE_INSERT;
         self
     }
 }
@@ -287,6 +295,29 @@ pub enum Insn {
         flags: CmpInsFlags,
         collation: Option<CollationSeq>,
     },
+    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
+    /// then jump to target_pc. Otherwise fall through.
+    /// False negatives are harmless. It is always safe to fall through, even if the value is
+    /// in the bloom filter. A false negative causes more CPU cycles to be used, but it should
+    /// still yield the correct answer. However, an incorrect answer may well arise from a
+    /// false positive - if the jump is taken when it should fall through.
+    Filter {
+        cursor_id: CursorID,
+        /// Jump target if bloom filter says "definitely not present"
+        target_pc: BranchOffset,
+        /// Start register containing the key(s) to check
+        key_reg: usize,
+        /// Number of key registers to hash together
+        num_keys: usize,
+    },
+    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// the bloom filter associated with the cursor/hash_table.
+    FilterAdd {
+        cursor_id: CursorID,
+        key_reg: usize,
+        num_keys: usize,
+    },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
         lhs: usize,
@@ -406,6 +437,16 @@ pub enum Insn {
         ///  The database within which this virtual table needs to be destroyed (P1).
         db: usize,
     },
+    VBegin {
+        /// The database within which this virtual table transaction needs to begin (P1).
+        cursor_id: CursorID,
+    },
+    VRename {
+        /// The database within which this virtual table needs to be renamed (P1).
+        cursor_id: CursorID,
+        /// New name of the virtual table (P2).
+        new_name_reg: usize,
+    },
 
     /// Open a cursor for a pseudo-table that contains a single row.
     OpenPseudo {
@@ -511,6 +552,18 @@ pub enum Insn {
     Return {
         return_reg: usize,
         can_fallthrough: bool,
+    },
+
+    /// Invoke a trigger subprogram.
+    ///
+    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// "The Program opcode invokes the trigger subprogram. The Program instruction
+    /// allocates and initializes a fresh register set for each invocation of the
+    /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
+    /// is used by subprograms to access content in registers of the calling bytecode program."
+    Program {
+        params: Vec<Value>,
+        program: Arc<RwLock<Statement>>,
     },
 
     /// Write an integer value into a register.
@@ -744,6 +797,32 @@ pub enum Insn {
         pc_if_next: BranchOffset,
     },
 
+    /// Insert the integer value held by register P2 into a RowSet object held in register P1.
+    /// An assertion fails if P2 is not an integer.
+    RowSetAdd {
+        rowset_reg: usize, // P1 - register holding RowSet
+        value_reg: usize,  // P2 - register holding integer value to add
+    },
+
+    /// Extract the smallest value from the RowSet object in P1 and put that value into register P3.
+    /// Or, if RowSet object P1 is initially empty, leave P3 unchanged and jump to instruction P2.
+    RowSetRead {
+        rowset_reg: usize,         // P1 - register holding RowSet
+        pc_if_empty: BranchOffset, // P2 - jump target if empty
+        dest_reg: usize,           // P3 - register to store smallest value
+    },
+
+    /// Register P3 is assumed to hold a 64-bit integer value. If register P1 contains a RowSet object
+    /// and that RowSet object contains the value held in P3, jump to register P2. Otherwise, insert
+    /// the integer in P3 into the RowSet and continue on to the next opcode.
+    /// P4 is the batch identifier (0 for first set, -1 for final set, >0 for other sets).
+    RowSetTest {
+        rowset_reg: usize,         // P1 - register holding RowSet
+        pc_if_found: BranchOffset, // P2 - jump target if value found
+        value_reg: usize,          // P3 - register holding integer value to test/insert
+        batch: i32,                // P4 - batch identifier
+    },
+
     /// Function
     Function {
         constant_mask: i32, // P1
@@ -791,6 +870,8 @@ pub enum Insn {
     Delete {
         cursor_id: CursorID,
         table_name: String,
+        /// Whether the DELETE is part of an UPDATE statement. If so, it doesn't count towards the change counter.
+        is_part_of_update: bool,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
@@ -871,6 +952,25 @@ pub enum Insn {
         flags: CreateBTreeFlags,
     },
 
+    /// Create custom index method (calls [crate::index_method::IndexMethodCursor::create] under the hood)
+    IndexMethodCreate {
+        db: usize,
+        cursor_id: CursorID,
+    },
+    /// Destroy custom index method (calls [crate::index_method::IndexMethodCursor::destroy] under the hood)
+    IndexMethodDestroy {
+        db: usize,
+        cursor_id: CursorID,
+    },
+    /// Query custom index method (call [crate::index_method::IndexMethodCursor::query_start] under the hood)
+    IndexMethodQuery {
+        db: usize,
+        cursor_id: CursorID,
+        start_reg: usize,
+        count_reg: usize,
+        pc_if_empty: BranchOffset,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The root page of the table/index to destroy
@@ -915,6 +1015,13 @@ pub enum Insn {
         db: usize,
         //  The name of the index being dropped
         index: Arc<Index>,
+    },
+    /// Drop a trigger
+    DropTrigger {
+        /// The database within which this trigger needs to be dropped (P1).
+        db: usize,
+        /// The name of the trigger being dropped
+        trigger_name: String,
     },
 
     /// Close a cursor.
@@ -1176,14 +1283,78 @@ pub enum Insn {
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
         increment_value: isize,
-        is_scope: bool,
+        deferred: bool,
     },
     // This opcode tests if a foreign key constraint-counter is currently zero. If so, jump to instruction P2. Otherwise, fall through to the next instruction.
     // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).
     // If P1 is zero, the jump is taken if the statement constraint-counter is zero (immediate foreign key constraint violations).
     FkIfZero {
-        is_scope: bool,
+        deferred: bool,
         target_pc: BranchOffset,
+    },
+
+    /// Build a hash table from a cursor for hash join.
+    /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
+    /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
+    /// Optionally also stores payload values (result columns from the build table) to avoid
+    /// an additional btree seek during probe phase.
+    HashBuild {
+        cursor_id: CursorID,
+        key_start_reg: usize,
+        num_keys: usize,
+        hash_table_id: usize,
+        mem_budget: usize,
+        collations: Vec<CollationSeq>,
+        /// Starting register for payload columns to store in the hash entry.
+        /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
+        payload_start_reg: Option<usize>,
+        /// Number of payload columns to read
+        num_payload: usize,
+    },
+
+    /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
+    /// Should be called after the HashBuild loop completes.
+    HashBuildFinalize {
+        hash_table_id: usize,
+    },
+
+    /// Probe a hash table for matches.
+    /// Extract probe keys from registers key_start_reg..key_start_reg+num_keys-1,
+    /// hash them, and look up matches in the hash table stored in hash_table_reg.
+    /// For each match, load the build-side rowid into dest_reg and continue.
+    /// If payload columns were stored during build, they are written to
+    /// payload_dest_reg..payload_dest_reg+num_payload-1.
+    /// If no matches, jump to target_pc.
+    HashProbe {
+        hash_table_id: usize,
+        key_start_reg: usize,
+        num_keys: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
+    },
+
+    /// Advance to next matching row in hash table bucket.
+    /// Used for handling hash collisions and duplicate keys.
+    /// If another match is found, store rowid in dest_reg (and payload in payload_dest_reg if set).
+    /// If no more matches, jump to target_pc.
+    HashNext {
+        hash_table_id: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry, if we are caching payload.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
+    },
+
+    /// Free hash table resources.
+    /// Closes the hash table referenced by hash_table_id and releases memory.
+    HashClose {
+        hash_table_id: usize,
     },
 }
 
@@ -1192,7 +1363,9 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
 
     let mut insn = 0;
     while insn < InsnVariants::COUNT {
-        result[insn] = InsnVariants::from_repr(insn as u8).unwrap().to_function();
+        result[insn] = InsnVariants::from_repr(insn as u8)
+            .expect("insn index should be valid within COUNT")
+            .to_function();
         insn += 1;
     }
 
@@ -1265,6 +1438,7 @@ impl InsnVariants {
             InsnVariants::Gosub => execute::op_gosub,
             InsnVariants::Return => execute::op_return,
             InsnVariants::Integer => execute::op_integer,
+            InsnVariants::Program => execute::op_program,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,
@@ -1292,6 +1466,9 @@ impl InsnVariants {
             InsnVariants::SorterData => execute::op_sorter_data,
             InsnVariants::SorterNext => execute::op_sorter_next,
             InsnVariants::SorterCompare => execute::op_sorter_compare,
+            InsnVariants::RowSetAdd => execute::op_rowset_add,
+            InsnVariants::RowSetRead => execute::op_rowset_read,
+            InsnVariants::RowSetTest => execute::op_rowset_test,
             InsnVariants::Function => execute::op_function,
             InsnVariants::Cast => execute::op_cast,
             InsnVariants::InitCoroutine => execute::op_init_coroutine,
@@ -1310,9 +1487,13 @@ impl InsnVariants {
             InsnVariants::OpenWrite => execute::op_open_write,
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
+            InsnVariants::IndexMethodCreate => execute::op_index_method_create,
+            InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
+            InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
+            InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -1353,6 +1534,15 @@ impl InsnVariants {
             InsnVariants::SequenceTest => execute::op_sequence_test,
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
+            InsnVariants::VBegin => execute::op_vbegin,
+            InsnVariants::VRename => execute::op_vrename,
+            InsnVariants::FilterAdd => execute::op_filter_add,
+            InsnVariants::Filter => execute::op_filter,
+            InsnVariants::HashBuild => execute::op_hash_build,
+            InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
+            InsnVariants::HashProbe => execute::op_hash_probe,
+            InsnVariants::HashNext => execute::op_hash_next,
+            InsnVariants::HashClose => execute::op_hash_close,
         }
     }
 }

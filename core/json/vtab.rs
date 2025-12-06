@@ -111,13 +111,15 @@ impl InternalVirtualTable for JsonVirtualTable {
         };
 
         if argc >= 1 {
-            usages[json_idx.unwrap()] = ConstraintUsage {
+            let idx = json_idx.expect("json_idx should be Some when argc >= 1");
+            usages[idx] = ConstraintUsage {
                 argv_index: Some(1),
                 omit: true,
             };
         }
         if argc == 2 {
-            usages[path_idx.unwrap()] = ConstraintUsage {
+            let idx = path_idx.expect("path_idx should be Some when argc == 2");
+            usages[idx] = ConstraintUsage {
                 argv_index: Some(2),
                 omit: true,
             };
@@ -231,7 +233,13 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
             if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty() && text.value.windows(3).any(|chars| chars == b"[#-") {
+                if !text.value.is_empty()
+                    && text
+                        .value
+                        .as_bytes()
+                        .windows(3)
+                        .any(|chars| chars == b"[#-")
+                {
                     return Err(LimboError::InvalidArgument(
                         "Json paths with negative indices in json_tree are not supported yet"
                             .to_owned(),
@@ -276,10 +284,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         match self.traversal_mode {
             JsonTraversalMode::Each => self.next(),
             JsonTraversalMode::Tree => {
-                if matches!(
-                    self.peek_state().unwrap().iterator_state,
-                    IteratorState::Primitive(_)
-                ) {
+                let state = self.peek_state().ok_or_else(|| {
+                    crate::LimboError::InternalError("state stack should not be empty".to_string())
+                })?;
+                if matches!(state.iterator_state, IteratorState::Primitive(_)) {
                     self.next()
                 } else {
                     self.columns = Columns::new(
@@ -495,7 +503,7 @@ mod columns {
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::Integer(*i),
-                Key::String(ref s) => Value::Text(Text::new(&s.to_owned().replace("\\\"", "\""))),
+                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
                 Key::None => Value::Null,
             }
         }
@@ -572,7 +580,7 @@ mod columns {
                 | jsonb::ElementType::TEXTRAW => {
                     let s = value.to_string();
                     let s = (s[1..s.len() - 1]).to_string();
-                    Ok(Value::Text(Text::new(&s)))
+                    Ok(Value::Text(Text::new(s)))
                 }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
@@ -599,11 +607,11 @@ mod columns {
         }
 
         pub(super) fn fullkey(&self) -> Value {
-            Value::Text(Text::new(&self.fullkey))
+            Value::Text(Text::new(self.fullkey.clone()))
         }
 
         pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new(&self.innermost_container_path))
+            Value::Text(Text::new(self.innermost_container_path.clone()))
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -748,7 +756,11 @@ impl InPlaceJsonPath {
         if self.element_lengths.len() == 1 {
             self.cursor()
         } else {
-            self.cursor() - self.element_lengths.last().unwrap()
+            self.cursor()
+                - self
+                    .element_lengths
+                    .last()
+                    .expect("element_lengths should not be empty in else branch")
         }
     }
 

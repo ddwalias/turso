@@ -32,7 +32,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, LimboError, OpenFlags, QueryMode, Statement, StepResult, Value,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, StepResult,
+    Value,
 };
 
 #[derive(Parser, Debug)]
@@ -78,6 +79,10 @@ pub struct Opts {
     pub mcp: bool,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
+    #[clap(long, help = "Enable experimental index method feature")]
+    pub experimental_index_method: bool,
+    #[clap(long, help = "Enable experimental autovacuum feature")]
+    pub experimental_autovacuum: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -106,44 +111,65 @@ macro_rules! row_step_result_query {
             return Ok(());
         }
 
-        let start = Instant::now();
+        let start = if $stats.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         match $rows.step() {
             Ok(StepResult::Row) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
 
                 $row_handle
             }
             Ok(StepResult::IO) => {
-                let start = Instant::now();
+                if let Some(ref mut stats) = $stats {
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
+                }
+                let start = if $stats.is_some() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 $rows.run_once()?;
                 if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.elapsed());
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
                 }
             }
             Ok(StepResult::Interrupt) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Done) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Busy) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let _ = $app.writeln("database is busy");
                 break;
             }
             Err(err) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let report = miette::Error::from(err).with_source_code($sql.to_owned());
                 let _ = $app.writeln_fmt(format_args!("{report:?}"));
@@ -163,14 +189,17 @@ impl Limbo {
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
         let indexes_enabled = opts.experimental_indexes.unwrap_or(true);
+
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
             Connection::from_uri(
                 &db_file,
-                indexes_enabled,
-                opts.experimental_mvcc,
-                opts.experimental_views,
-                opts.experimental_strict,
-                opts.experimental_encryption,
+                DatabaseOpts::new()
+                    .with_indexes(indexes_enabled)
+                    .with_mvcc(opts.experimental_mvcc)
+                    .with_views(opts.experimental_views)
+                    .with_strict(opts.experimental_strict)
+                    .with_encryption(opts.experimental_encryption)
+                    .with_index_method(opts.experimental_index_method),
             )?
         } else {
             let flags = if opts.readonly {
@@ -188,6 +217,8 @@ impl Limbo {
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
+                    .with_index_method(opts.experimental_index_method)
+                    .with_autovacuum(opts.experimental_autovacuum)
                     .turso_cli(),
                 None,
             )?;
@@ -835,15 +866,34 @@ impl Limbo {
                         indent_count: usize,
                         curr_insn: &str,
                         prev_insn: &str,
+                        p1: &str,
+                        unclosed_begin_subrtns: &mut Vec<String>,
                     ) -> usize {
                         let indent_count = match prev_insn {
                             "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
-                            | "SeekLT" => indent_count + 1,
+                            | "SeekLT" | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
                             _ => indent_count,
                         };
 
+                        // The corresponding closing instruction for BeginSubrtn is Return,
+                        // but Return is also used for other purposes, so we need to track pairs of
+                        // BeginSubrtn and Return that share the same 1st parameter (the subroutine register).
+                        if curr_insn == "BeginSubrtn" {
+                            unclosed_begin_subrtns.push(p1.to_string());
+                        }
+
                         match curr_insn {
-                            "Next" | "SorterNext" | "Prev" => indent_count - 1,
+                            "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
+                            "Return" => {
+                                let matching_begin_subrtn =
+                                    unclosed_begin_subrtns.iter().position(|b| b == p1);
+                                if let Some(matching_begin_subrtn) = matching_begin_subrtn {
+                                    unclosed_begin_subrtns.remove(matching_begin_subrtn);
+                                    indent_count.saturating_sub(1)
+                                } else {
+                                    indent_count
+                                }
+                            }
                             _ => indent_count,
                         }
                     }
@@ -858,16 +908,24 @@ impl Limbo {
                     let mut prev_insn: String = "".to_string();
                     let mut indent_count = 0;
                     let indent = "  ";
+                    let mut unclosed_begin_subrtns = vec![];
                     loop {
                         row_step_result_query!(self, sql, rows, statistics, {
                             let row = rows.row().unwrap();
                             let insn = row.get_value(1).to_string();
-                            indent_count = get_explain_indent(indent_count, &insn, &prev_insn);
+                            let p1 = row.get_value(2).to_string();
+                            indent_count = get_explain_indent(
+                                indent_count,
+                                &insn,
+                                &prev_insn,
+                                &p1,
+                                &mut unclosed_begin_subrtns,
+                            );
                             let _ = self.writeln(format!(
                                 "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
                                 row.get_value(0).to_string(),
                                 &(indent.repeat(indent_count) + &insn),
-                                row.get_value(2).to_string(),
+                                p1,
                                 row.get_value(3).to_string(),
                                 row.get_value(4).to_string(),
                                 row.get_value(5).to_string(),
@@ -1239,26 +1297,33 @@ impl Limbo {
     }
 
     fn display_indexes(&mut self, maybe_table: Option<String>) -> anyhow::Result<()> {
-        let sql = match maybe_table {
-            Some(ref tbl_name) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
-            ),
-            None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
-        };
-
         let mut indexes = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
-                indexes.push_str(idx.as_str());
-                indexes.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(err) = self.handle_row(&sql, handler) {
-            if err.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", err));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match maybe_table {
+                Some(ref tbl_name) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
+                ),
+                None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        indexes.push_str(prefix);
+                        indexes.push('.');
+                    }
+                    indexes.push_str(idx.as_str());
+                    indexes.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(err) = self.handle_row(&sql, handler) {
+                if err.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", err));
+                }
             }
         }
         if !indexes.is_empty() {
@@ -1268,28 +1333,35 @@ impl Limbo {
     }
 
     fn display_tables(&mut self, pattern: Option<&str>) -> anyhow::Result<()> {
-        let sql = match pattern {
-            Some(pattern) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
-            ),
-            None => String::from(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
-            ),
-        };
-
         let mut tables = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
-                tables.push_str(table.as_str());
-                tables.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(e) = self.handle_row(&sql, handler) {
-            if e.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", e));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match pattern {
+                Some(pattern) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
+                ),
+                None => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                ),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        tables.push_str(prefix);
+                        tables.push('.');
+                    }
+                    tables.push_str(table.as_str());
+                    tables.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(e) = self.handle_row(&sql, handler) {
+                if e.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", e));
+                }
             }
         }
         if !tables.is_empty() {
@@ -1302,6 +1374,21 @@ impl Limbo {
             let _ = self.writeln(b"No tables found in the database.");
         }
         Ok(())
+    }
+
+    fn database_names(&mut self) -> anyhow::Result<Vec<String>> {
+        let sql = "PRAGMA database_list";
+        let mut db_names: Vec<String> = Vec::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            if let Ok(Value::Text(name)) = row.get::<&Value>(1) {
+                db_names.push(name.to_string());
+            }
+            Ok(())
+        };
+        match self.handle_row(sql, handler) {
+            Ok(_) => Ok(db_names),
+            Err(e) => Err(anyhow::anyhow!("Error in database list: {}", e)),
+        }
     }
 
     fn handle_row<F>(&mut self, sql: &str, mut handler: F) -> anyhow::Result<()>
@@ -1635,7 +1722,7 @@ impl Limbo {
             Value::Float(f) => write!(out, "{f}").map(|_| ()),
             Value::Text(s) => {
                 out.write_all(b"'")?;
-                let bytes = &s.value;
+                let bytes = s.value.as_bytes();
                 let mut i = 0;
                 while i < bytes.len() {
                     let b = bytes[i];

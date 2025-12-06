@@ -3,14 +3,13 @@ use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::{emit_explain, QueryMode, SymbolTable};
+use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
-use turso_parser::ast::{CompoundOperator, SortOrder};
+use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
 use tracing::Level;
 
@@ -21,7 +20,7 @@ pub fn emit_program_for_compound_select(
     plan: Plan,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
-        left: _left,
+        left,
         right_most,
         limit,
         offset,
@@ -41,44 +40,66 @@ pub fn emit_program_for_compound_select(
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.as_ref().map(|limit| {
-        let reg = program.alloc_register();
-        if let Some(val) = try_fold_expr_to_i64(limit) {
-            program.emit_insn(Insn::Integer {
-                value: val,
-                dest: reg,
-            });
-        } else {
-            program.add_comment(program.offset(), "OFFSET expr");
-            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+    let limit_ctx = limit
+        .as_ref()
+        .map(|limit| {
+            let reg = program.alloc_register();
+            match limit.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::MustBeInt { reg });
+                    }
+                }
+                _ => {
+                    _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+                    program.add_comment(program.offset(), "LIMIT counter");
+                    program.emit_insn(Insn::MustBeInt { reg });
+                }
+            }
+            Ok::<_, LimboError>(LimitCtx::new_shared(reg))
+        })
+        .transpose()?;
+    let offset_reg = offset
+        .as_ref()
+        .map(|offset_expr| {
+            let reg = program.alloc_register();
+            match offset_expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    // Compile-time constant offset
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid offset".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
+                    }
+                }
+                _ => {
+                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+                }
+            }
+            program.add_comment(program.offset(), "OFFSET counter");
             program.emit_insn(Insn::MustBeInt { reg });
-        }
-        LimitCtx::new_shared(reg)
-    });
-    let offset_reg = offset.as_ref().map(|offset_expr| {
-        let reg = program.alloc_register();
-
-        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
-            // Compile-time constant offset
-            program.emit_insn(Insn::Integer {
-                value: val,
-                dest: reg,
+            let combined_reg = program.alloc_register();
+            program.add_comment(program.offset(), "OFFSET + LIMIT");
+            program.emit_insn(Insn::OffsetLimit {
+                offset_reg: reg,
+                combined_reg,
+                limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
             });
-        } else {
-            program.add_comment(program.offset(), "OFFSET expr");
-            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
-            program.emit_insn(Insn::MustBeInt { reg });
-        }
 
-        let combined_reg = program.alloc_register();
-        program.emit_insn(Insn::OffsetLimit {
-            offset_reg: reg,
-            combined_reg,
-            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
-        });
-
-        reg
-    });
+            Ok::<_, LimboError>(reg)
+        })
+        .transpose()?;
 
     // When a compound SELECT is part of a query that yields results to a coroutine (e.g. within an INSERT clause),
     // we must allocate registers for the result columns to be yielded. Each subselect will then yield to
@@ -92,6 +113,25 @@ pub fn emit_program_for_compound_select(
     };
 
     emit_explain!(program, true, "COMPOUND QUERY".to_owned());
+
+    // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
+    // must set the result columns to the leftmost subselect's result columns to be compatible
+    // with SQLite.
+    program.result_columns = left[0].0.result_columns.clone();
+
+    // These must also be set because we make the decision to start a transaction based on whether
+    // any tables are actually touched by the query. Previously this only used the rightmost subselect's
+    // table references, but that breaks down with e.g. "SELECT * FROM t UNION VALUES(1)" where VALUES(1)
+    // does not have any table references and we would erroneously not start a transaction.
+    for (plan, _) in left {
+        program
+            .table_references
+            .extend(plan.table_references.clone());
+    }
+    program
+        .table_references
+        .extend(right_plan.table_references.clone());
+
     emit_compound_select(
         program,
         plan,
@@ -103,9 +143,6 @@ pub fn emit_program_for_compound_select(
         reg_result_cols_start,
     )?;
     program.pop_current_parent_explain();
-
-    program.result_columns = right_plan.result_columns;
-    program.table_references.extend(right_plan.table_references);
 
     Ok(())
 }
@@ -204,7 +241,7 @@ fn emit_compound_select(
                     } => (cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most, schema)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -260,10 +297,18 @@ fn emit_compound_select(
                 }
 
                 let (left_cursor_id, left_index) =
-                    create_dedupe_index(program, &right_most, schema)?;
+                    create_dedupe_index(program, &plan, &right_most, schema)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
+                    is_delete: false,
+                };
+
+                let (right_cursor_id, right_index) =
+                    create_dedupe_index(program, &plan, &right_most, schema)?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: right_cursor_id,
+                    index: right_index,
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -284,13 +329,6 @@ fn emit_compound_select(
                     reg_result_cols_start,
                 )?;
 
-                let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, &right_most, schema)?;
-                right_most.query_destination = QueryDestination::EphemeralIndex {
-                    cursor_id: right_cursor_id,
-                    index: right_index,
-                    is_delete: false,
-                };
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -313,7 +351,7 @@ fn emit_compound_select(
                     } => (cursor_id, index),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most, schema)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -376,30 +414,46 @@ fn emit_compound_select(
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
-    select: &SelectPlan,
+    left_select: &SelectPlan,
+    right_select: &SelectPlan,
     schema: &Schema,
 ) -> crate::Result<(usize, Arc<Index>)> {
     if !schema.indexes_enabled {
         crate::bail_parse_error!("UNION OR INTERSECT or EXCEPT is not supported without indexes");
     }
 
-    let mut dedupe_columns = select
+    let mut dedupe_columns = right_select
         .result_columns
         .iter()
-        .map(|c| IndexColumn {
+        .enumerate()
+        .map(|(i, c)| IndexColumn {
             name: c
-                .name(&select.table_references)
+                .name(&right_select.table_references)
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             order: SortOrder::Asc,
-            pos_in_table: 0,
+            pos_in_table: i,
             default: None,
             collation: None,
+            expr: None,
         })
         .collect::<Vec<_>>();
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        column.collation =
-            get_collseq_from_expr(&select.result_columns[i].expr, &select.table_references)?;
+        let left_collation = get_collseq_from_expr(
+            &left_select.result_columns[i].expr,
+            &left_select.table_references,
+        )?;
+        let right_collation = get_collseq_from_expr(
+            &right_select.result_columns[i].expr,
+            &right_select.table_references,
+        )?;
+        // Left precedence
+        let collation = match (left_collation, right_collation) {
+            (None, None) => None,
+            (Some(coll), None) | (None, Some(coll)) => Some(coll),
+            (Some(coll), Some(_)) => Some(coll),
+        };
+        column.collation = collation;
     }
 
     let dedupe_index = Arc::new(Index {
@@ -411,6 +465,7 @@ fn create_dedupe_index(
         unique: false,
         has_rowid: false,
         where_clause: None,
+        index_method: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

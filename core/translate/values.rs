@@ -1,4 +1,4 @@
-use crate::translate::emitter::{Resolver, TranslateCtx};
+use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_offset;
@@ -10,7 +10,7 @@ use crate::Result;
 pub fn emit_values(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-    t_ctx: &TranslateCtx,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     if plan.values.len() == 1 {
         let start_reg = emit_values_when_single_row(program, plan, t_ctx)?;
@@ -20,10 +20,24 @@ pub fn emit_values(
     let reg_result_cols_start = match plan.query_destination {
         QueryDestination::ResultRows => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::CoroutineYield { yield_reg, .. } => {
-            emit_values_in_subquery(program, plan, &t_ctx.resolver, yield_reg)?
+            emit_values_in_subquery(program, plan, t_ctx, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: result_reg,
+            });
+            result_reg
+        }
+        QueryDestination::RowValueSubqueryResult { .. } => {
+            emit_toplevel_values(program, plan, t_ctx)?
+        }
+        QueryDestination::RowSet { .. } => {
+            unreachable!("RowSet query destination should not be used in values emission")
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     };
     Ok(reg_result_cols_start)
 }
@@ -31,13 +45,21 @@ pub fn emit_values(
 fn emit_values_when_single_row(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-    t_ctx: &TranslateCtx,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let end_label = program.allocate_label();
     emit_offset(program, end_label, t_ctx.reg_offset);
     let first_row = &plan.values[0];
     let row_len = first_row.len();
-    let start_reg = program.alloc_registers(row_len);
+    let start_reg = if let Some(reg) = t_ctx.reg_result_cols_start {
+        program.reg_result_cols_start = Some(reg);
+        reg
+    } else {
+        let reg = program.alloc_registers(row_len);
+        t_ctx.reg_result_cols_start = Some(reg);
+        program.reg_result_cols_start = Some(reg);
+        reg
+    };
     for (i, v) in first_row.iter().enumerate() {
         translate_expr_no_constant_opt(
             program,
@@ -56,7 +78,7 @@ fn emit_values_when_single_row(
 fn emit_toplevel_values(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-    t_ctx: &TranslateCtx,
+    t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let definition_label = program.allocate_label();
@@ -68,7 +90,7 @@ fn emit_toplevel_values(
     });
     program.preassign_label_to_next_insn(start_offset_label);
 
-    let start_reg = emit_values_in_subquery(program, plan, &t_ctx.resolver, yield_reg)?;
+    let start_reg = emit_values_in_subquery(program, plan, t_ctx, yield_reg)?;
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(definition_label);
@@ -112,11 +134,19 @@ fn emit_toplevel_values(
 fn emit_values_in_subquery(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-    resolver: &Resolver,
+    t_ctx: &mut TranslateCtx,
     yield_reg: usize,
 ) -> Result<usize> {
     let row_len = plan.values[0].len();
-    let start_reg = program.alloc_registers(row_len);
+    let start_reg = if let Some(reg) = t_ctx.reg_result_cols_start {
+        program.reg_result_cols_start = Some(reg);
+        reg
+    } else {
+        let reg = program.alloc_registers(row_len);
+        t_ctx.reg_result_cols_start = Some(reg);
+        program.reg_result_cols_start = Some(reg);
+        reg
+    };
     for value in &plan.values {
         for (i, v) in value.iter().enumerate() {
             translate_expr_no_constant_opt(
@@ -124,7 +154,7 @@ fn emit_values_in_subquery(
                 None,
                 v,
                 start_reg + i,
-                resolver,
+                &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
         }
@@ -168,6 +198,27 @@ fn emit_values_to_destination(
             emit_values_to_index(program, plan, start_reg, row_len);
         }
         QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: *result_reg,
+            });
+        }
+        QueryDestination::RowValueSubqueryResult {
+            result_reg_start,
+            num_regs,
+        } => {
+            assert!(row_len == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            program.emit_insn(Insn::Copy {
+                src_reg: start_reg,
+                dst_reg: *result_reg_start,
+                extra_amount: num_regs - 1,
+            });
+        }
+        QueryDestination::RowSet { .. } => {
+            unreachable!("RowSet query destination should not be used in values emission")
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
 }
 

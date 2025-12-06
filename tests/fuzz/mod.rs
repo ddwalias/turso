@@ -1,29 +1,27 @@
 pub mod grammar_generator;
+pub mod rowid_alias;
 
 #[cfg(test)]
-mod tests {
+mod fuzz_tests {
     use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
-    use rand::{Rng, SeedableRng};
+    use rand::Rng;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use turso_core::DatabaseOpts;
 
-    use crate::{
-        common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
-            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, rusqlite_integrity_check,
-            sqlite_exec_rows, TempDatabase,
-        },
-        fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
+    use core_tester::common::{
+        do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+        maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
+        TempDatabase,
     };
+
+    use super::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator};
 
     use super::grammar_generator::SymbolHandle;
 
     /// [See this issue for more info](https://github.com/tursodatabase/turso/issues/1763)
-    #[test]
-    pub fn fuzz_failure_issue_1763() {
-        let db = TempDatabase::new_empty(false);
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_failure_issue_1763(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
@@ -35,9 +33,8 @@ mod tests {
         );
     }
 
-    #[test]
-    pub fn arithmetic_expression_fuzz_ex1() {
-        let db = TempDatabase::new_empty(false);
+    #[turso_macros::test(mvcc)]
+    pub fn arithmetic_expression_fuzz_ex1(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -54,12 +51,13 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn rowid_seek_fuzz() {
-        let db = TempDatabase::new_with_rusqlite(
-            "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)",
-            false,
-        ); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+    // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+    #[turso_macros::test(
+        mvcc,
+        init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"
+    )]
+    pub fn rowid_seek_fuzz(db: TempDatabase) {
+        let _ = tracing_subscriber::fmt::try_init();
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
@@ -96,7 +94,7 @@ mod tests {
         tracing::info!("rowid_seek_fuzz seed: {}", seed);
 
         for iteration in 0..2 {
-            tracing::trace!("rowid_seek_fuzz iteration: {}", iteration);
+            tracing::info!("rowid_seek_fuzz iteration: {}", iteration);
 
             for comp in COMPARISONS.iter() {
                 for order_by in ORDER_BY.iter() {
@@ -110,7 +108,7 @@ mod tests {
                             order_by.unwrap_or("")
                         );
 
-                        log::trace!("query: {query}");
+                        tracing::info!("query: {query}");
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
@@ -171,9 +169,8 @@ mod tests {
         values
     }
 
-    #[test]
-    pub fn index_scan_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x PRIMARY KEY)", true);
+    #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
+    pub fn index_scan_fuzz(db: TempDatabase) {
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let insert = format!(
@@ -217,16 +214,15 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
-    pub fn index_scan_compound_key_fuzz() {
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+    pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
+        let (mut rng, seed) = rng_from_time_or_env();
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
         let table_defs: [&str; 8] = [
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y, z))",
@@ -238,16 +234,10 @@ mod tests {
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y desc, z desc))",
         ];
         // Create all different 3-column primary key permutations
-        let dbs = [
-            TempDatabase::new_with_rusqlite(table_defs[0], true),
-            TempDatabase::new_with_rusqlite(table_defs[1], true),
-            TempDatabase::new_with_rusqlite(table_defs[2], true),
-            TempDatabase::new_with_rusqlite(table_defs[3], true),
-            TempDatabase::new_with_rusqlite(table_defs[4], true),
-            TempDatabase::new_with_rusqlite(table_defs[5], true),
-            TempDatabase::new_with_rusqlite(table_defs[6], true),
-            TempDatabase::new_with_rusqlite(table_defs[7], true),
-        ];
+        let dbs = table_defs
+            .iter()
+            .map(|init_sql| builder.clone().with_init_sql(init_sql).build())
+            .collect::<Vec<_>>();
         let mut pk_tuples = HashSet::new();
         while pk_tuples.len() < 100000 {
             pk_tuples.insert((
@@ -513,16 +503,207 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn collation_fuzz() {
+    fn join_fuzz_inner(db: TempDatabase, add_indexes: bool, iterations: usize, rows: i64) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("join_fuzz_inner (add_indexes={add_indexes}) seed: {seed}",);
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let limbo_db = builder.clone().build();
+        let sqlite_db = builder.clone().build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+        let schema = r#"
+        CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);"#;
+
+        sqlite_conn.execute_batch(schema).unwrap();
+        limbo_conn.prepare_execute_batch(schema).unwrap();
+
+        if add_indexes {
+            let index_ddl = r#"
+            CREATE INDEX t1_a_idx ON t1(a);
+            CREATE INDEX t1_b_idx ON t1(b);
+            CREATE INDEX t1_c_idx ON t1(c);
+            CREATE INDEX t1_d_idx ON t1(d);
+
+            CREATE INDEX t2_a_idx ON t2(a);
+            CREATE INDEX t2_b_idx ON t2(b);
+            CREATE INDEX t2_c_idx ON t2(c);
+            CREATE INDEX t2_d_idx ON t2(d);
+
+            CREATE INDEX t3_a_idx ON t3(a);
+            CREATE INDEX t3_b_idx ON t3(b);
+            CREATE INDEX t3_c_idx ON t3(c);
+            CREATE INDEX t3_d_idx ON t3(d);
+
+            CREATE INDEX t4_a_idx ON t4(a);
+            CREATE INDEX t4_b_idx ON t4(b);
+            CREATE INDEX t4_c_idx ON t4(c);
+            CREATE INDEX t4_d_idx ON t4(d);
+        "#;
+            sqlite_conn.execute_batch(index_ddl).unwrap();
+            limbo_conn.prepare_execute_batch(index_ddl).unwrap();
+        }
+
+        let tables = ["t1", "t2", "t3", "t4"];
+        for (t_idx, tname) in tables.iter().enumerate() {
+            for i in 0..rows {
+                let id = i + 1 + (t_idx as i64) * 10_000;
+
+                // 25% chance of NULL per column.
+                let gen_val = |rng: &mut ChaCha8Rng| {
+                    if rng.random_range(0..4) == 0 {
+                        None
+                    } else {
+                        Some(rng.random_range(-10..=20))
+                    }
+                };
+                let a = gen_val(&mut rng);
+                let b = gen_val(&mut rng);
+                let c = gen_val(&mut rng);
+                let d = gen_val(&mut rng);
+
+                let fmt_val = |v: Option<i32>| match v {
+                    Some(x) => x.to_string(),
+                    None => "NULL".to_string(),
+                };
+
+                let stmt = format!(
+                    "INSERT INTO {tname}(id,a,b,c,d) VALUES ({id}, {a}, {b}, {c}, {d})",
+                    a = fmt_val(a),
+                    b = fmt_val(b),
+                    c = fmt_val(c),
+                    d = fmt_val(d),
+                );
+
+                sqlite_conn.execute(&stmt, params![]).unwrap();
+                limbo_conn.execute(&stmt).unwrap();
+            }
+        }
+
+        let non_pk_cols = ["a", "b", "c", "d"];
+
+        for iter in 0..iterations {
+            if iter % (iterations / 100).max(1) == 0 {
+                println!(
+                    "join_fuzz_inner(add_indexes={}) iter {}/{}",
+                    add_indexes,
+                    iter + 1,
+                    iterations
+                );
+            }
+
+            let num_tables = rng.random_range(2..=4);
+            let used_tables = &tables[..num_tables];
+
+            let mut select_cols: Vec<String> = Vec::new();
+            for t in used_tables.iter() {
+                select_cols.push(format!("{t}.id"));
+            }
+            let select_clause = select_cols.join(", ");
+            let mut from_clause = format!("FROM {}", used_tables[0]);
+            for i in 1..num_tables {
+                let left = used_tables[i - 1];
+                let right = used_tables[i];
+
+                let join_type = if rng.random_bool(0.5) {
+                    "JOIN"
+                } else {
+                    "LEFT JOIN"
+                };
+
+                let num_preds = rng.random_range(1..=3);
+                let mut preds = Vec::new();
+                for _ in 0..num_preds {
+                    let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                    preds.push(format!("{left}.{col} = {right}.{col}"));
+                }
+                preds.sort();
+                preds.dedup();
+
+                let on_clause = preds.join(" AND ");
+                from_clause = format!("{from_clause} {join_type} {right} ON {on_clause}");
+            }
+
+            // WHERE clause: 0..2 predicates on non-pk cols
+            let mut where_parts = Vec::new();
+            let num_where = rng.random_range(0..=2);
+            for _ in 0..num_where {
+                let t = used_tables[rng.random_range(0..num_tables)];
+                let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                let kind = rng.random_range(0..4);
+                let cond = match kind {
+                    0 => {
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} = {val}")
+                    }
+                    1 => {
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} <> {val}")
+                    }
+                    2 => format!("{t}.{col} IS NULL"),
+                    3 => format!("{t}.{col} IS NOT NULL"),
+                    _ => unreachable!(),
+                };
+                where_parts.push(cond);
+            }
+            let where_clause = if where_parts.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", where_parts.join(" AND "))
+            };
+            let order_clause = format!("ORDER BY {}", select_cols.join(", "));
+            let limit = 50;
+            let query = format!(
+                "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
+            );
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
+            if sqlite_rows != limbo_rows {
+                panic!(
+                "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
+                 sqlite ({} rows): {:?}\nlimbo ({} rows): {:?}\nsqlite path: {:?}\nlimbo path: {:?}",
+                add_indexes,
+                seed,
+                iter,
+                query,
+                sqlite_rows.len(),
+                sqlite_rows,
+                limbo_rows.len(),
+                limbo_rows,
+                sqlite_db.path,
+                limbo_db.path,
+            );
+            }
+        }
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, false, 2000, 200);
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_indexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, true, 2000, 200);
+    }
+
+    // TODO: Mvcc indexes
+    #[turso_macros::test()]
+    pub fn collation_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         // Build six table variants that assign BINARY/NOCASE/RTRIM across (a,b,c)
         // and include UNIQUE constraints so that auto-created indexes must honor column collations.
@@ -575,7 +756,7 @@ mod tests {
         // Create databases for each variant using rusqlite, then open limbo on the same file.
         let dbs: Vec<TempDatabase> = table_defs
             .iter()
-            .map(|ddl| TempDatabase::new_with_rusqlite(ddl, true))
+            .map(|ddl| builder.clone().with_init_sql(ddl).build())
             .collect();
 
         // Seed data focuses on case and trailing spaces to exercise NOCASE and RTRIM semantics.
@@ -614,15 +795,10 @@ mod tests {
         // Fuzz WHERE clauses with and without explicit COLLATE on a/b/c
         let columns = ["a", "b", "c"];
         let collates = [None, Some("BINARY"), Some("NOCASE"), Some("RTRIM")];
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
-        const ITERS: usize = 3000;
+        const ITERS: usize = 1000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
@@ -666,22 +842,31 @@ mod tests {
         }
     }
 
-    #[test]
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
     #[allow(unused_assignments)]
-    #[ignore] // ignoring because every error I can find is due to sqlite sub-transaction behavior
-    pub fn fk_deferred_constraints_fuzz() {
+    pub fn fk_deferred_constraints_and_triggers_fuzz(db: TempDatabase) {
+        let _ = tracing_subscriber::fmt::try_init();
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
-        println!("fk_deferred_constraints_fuzz seed: {seed}");
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("fk_deferred_constraints_and_triggers_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 10;
-        const INNER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!(
+                "fk_deferred_constraints_and_triggers_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -695,30 +880,47 @@ mod tests {
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let get_constraint_type = |rng: &mut ChaCha8Rng| match rng.random_range(0..3) {
+                0 => "INTEGER PRIMARY KEY",
+                1 => "UNIQUE",
+                2 => "PRIMARY KEY",
+                _ => unreachable!(),
+            };
+
             // Mix of immediate and deferred FK constraints
-            let s = log_and_exec("CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT)");
+            let s = log_and_exec(&format!(
+                "CREATE TABLE parent(id {}, a INT, b INT)",
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with DEFERRABLE INITIALLY DEFERRED FK
-            let s = log_and_exec(
-                "CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, x INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_deferred(id {}, pid INT, x INT, \
              FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with immediate FK (default)
-            let s = log_and_exec(
-                "CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, y INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_immediate(id {}, pid INT, y INT, \
              FOREIGN KEY(pid) REFERENCES parent(id))",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let composite_constraint = match rng.random_range(0..2) {
+                0 => "PRIMARY KEY",
+                1 => "UNIQUE",
+                _ => unreachable!(),
+            };
             // Composite key parent for deferred testing
             let s = log_and_exec(
-                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))",
+                &format!("CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_constraint}(a,b))"),
             );
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
@@ -758,13 +960,106 @@ mod tests {
                 }
             }
 
+            // Add triggers on every outer iteration (max 2 triggers)
+            // Create a log table for trigger operations
+            let s = log_and_exec(
+                "CREATE TABLE trigger_log(action TEXT, table_name TEXT, id_val INT, extra_val INT)",
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Create a stats table for tracking operations
+            let s = log_and_exec("CREATE TABLE trigger_stats(op_type TEXT PRIMARY KEY, count INT)");
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Define all available trigger types
+            let trigger_definitions: Vec<&str> = vec![
+                // BEFORE INSERT trigger on parent - logs and potentially creates a child
+                "CREATE TRIGGER trig_parent_before_insert BEFORE INSERT ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'parent', NEW.id, NEW.a);
+                 INSERT INTO trigger_stats VALUES ('parent_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Sometimes create a deferred child referencing this parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 10000, NEW.id, NEW.a);
+                END",
+                // AFTER INSERT trigger on child_deferred - logs and updates parent
+                "CREATE TRIGGER trig_child_deferred_after_insert AFTER INSERT ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_INSERT', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column if parent exists
+                 UPDATE parent SET a = a + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE UPDATE OF 'a' on parent - logs and modifies the update
+                "CREATE TRIGGER trig_parent_before_update_a BEFORE UPDATE OF a ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_UPDATE_A', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_update_a', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Also update 'b' column when 'a' is updated
+                 UPDATE parent SET b = NEW.a * 2 WHERE id = NEW.id;
+                END",
+                // AFTER UPDATE OF 'pid' on child_deferred - logs and creates/updates related records
+                "CREATE TRIGGER trig_child_deferred_after_update_pid AFTER UPDATE OF pid ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_PID', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_update_pid', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create a child_immediate referencing the new parent
+                 INSERT INTO child_immediate VALUES (NEW.id + 20000, NEW.pid, NEW.x);
+                 -- Update parent's 'b' column
+                 UPDATE parent SET b = b + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE DELETE on parent - logs and cascades to children
+                "CREATE TRIGGER trig_parent_before_delete BEFORE DELETE ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_DELETE', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Delete all children that reference the deleted parent
+                 DELETE FROM child_deferred WHERE pid = OLD.id;
+                END",
+                // AFTER DELETE on child_deferred - logs and updates parent stats
+                "CREATE TRIGGER trig_child_deferred_after_delete AFTER DELETE ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_DELETE', 'child_deferred', OLD.id, OLD.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a - 1 WHERE id = OLD.pid;
+                END",
+                // BEFORE INSERT on child_immediate - logs, creates parent if needed, updates stats
+                "CREATE TRIGGER trig_child_immediate_before_insert BEFORE INSERT ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'child_immediate', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create parent if it doesn't exist (with a default value)
+                 INSERT OR IGNORE INTO parent VALUES (NEW.pid, NEW.y, NEW.y * 2);
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a + NEW.y WHERE id = NEW.pid;
+                END",
+                // AFTER UPDATE OF 'y' on child_immediate - logs and cascades updates
+                "CREATE TRIGGER trig_child_immediate_after_update_y AFTER UPDATE OF y ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_Y', 'child_immediate', NEW.id, NEW.y);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_update_y', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' based on the change
+                 UPDATE parent SET a = a + (NEW.y - OLD.y) WHERE id = NEW.pid;
+                 -- Also create a deferred child referencing the same parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 30000, NEW.pid, NEW.y);
+                END",
+            ];
+
+            // Randomly select up to 2 triggers from the list
+            let num_triggers = rng.random_range(1..=2);
+            let mut selected_indices = std::collections::HashSet::new();
+            while selected_indices.len() < num_triggers {
+                selected_indices.insert(rng.random_range(0..trigger_definitions.len()));
+            }
+
+            // Create the selected triggers
+            for &idx in selected_indices.iter() {
+                let s = log_and_exec(trigger_definitions[idx]);
+                limbo_exec_rows(&limbo_db, &limbo, &s);
+                sqlite.execute(&s, params![]).unwrap();
+            }
+
             // Transaction-based mutations with mix of deferred and immediate operations
+            let mut in_tx = false;
             for tx_num in 0..INNER_ITERS {
                 // Decide if we're in a transaction
-                let mut in_tx = false;
-                let use_transaction = rng.random_bool(0.7);
+                let start_a_transaction = rng.random_bool(0.7);
 
-                if use_transaction && !in_tx {
+                if start_a_transaction && !in_tx {
                     in_tx = true;
                     let s = log_and_exec("BEGIN");
                     let sres = sqlite.execute(&s, params![]);
@@ -890,7 +1185,7 @@ mod tests {
                         format!("DELETE FROM child_deferred WHERE id={id}")
                     }
                     // Self-referential deferred insert (create temp violation then fix)
-                    10 if use_transaction => {
+                    10 if start_a_transaction => {
                         let id = rng.random_range(400..=500);
                         let pid = id + 1; // References non-existent yet
                         format!("INSERT INTO child_deferred VALUES ({id}, {pid}, 0)")
@@ -906,7 +1201,7 @@ mod tests {
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
 
-                if !use_transaction && !in_tx {
+                if !start_a_transaction && !in_tx {
                     match (sres, lres) {
                         (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
                         (s, l) => {
@@ -924,8 +1219,8 @@ mod tests {
                     }
                 }
 
-                if use_transaction && in_tx {
-                    // Randomly COMMIT or ROLLBACK
+                // Randomly COMMIT or ROLLBACK some of the time
+                if in_tx && rng.random_bool(0.4) {
                     let commit = rng.random_bool(0.7);
                     let s = log_and_exec("COMMIT");
 
@@ -979,16 +1274,27 @@ mod tests {
                             );
                         }
                     }
+                    in_tx = false;
                 }
+            }
+            // Print all statements
+            if std::env::var("VERBOSE").is_ok() {
+                println!("{}", stmts.join("\n"));
+                println!("--------- ITERATION COMPLETED ---------");
             }
         }
     }
 
-    #[test]
-    pub fn fk_single_pk_mutation_fuzz() {
+    // TODO: mvcc state mismatch
+    #[turso_macros::test()]
+    pub fn fk_single_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -996,8 +1302,8 @@ mod tests {
         for outer in 0..OUTER_ITERS {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1095,7 +1401,14 @@ mod tests {
                         }
                         let a = rng.random_range(-5..=25);
                         let b = rng.random_range(-5..=25);
-                        format!("INSERT INTO p VALUES({id}, {a}, {b})")
+                        format!(
+                            "INSERT {} INTO p VALUES({id}, {a}, {b})",
+                            if rng.random_bool(0.4) {
+                                "OR REPLACE "
+                            } else {
+                                ""
+                            }
+                        )
                     }
                     // Parent UPDATE
                     1 => {
@@ -1128,7 +1441,14 @@ mod tests {
                             rng.random_range(1..=260) as i64
                         };
                         let y = rng.random_range(-10..=10);
-                        format!("INSERT INTO c VALUES({id}, {x}, {y})")
+                        format!(
+                            "INSERT {} INTO c VALUES({id}, {x}, {y})",
+                            if rng.random_bool(0.4) {
+                                "OR REPLACE "
+                            } else {
+                                ""
+                            }
+                        )
                     }
                     // Child UPDATE
                     4 => {
@@ -1272,11 +1592,16 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn fk_edgecases_fuzzing() {
+    // TODO: mvcc does not work
+    #[turso_macros::test()]
+    pub fn fk_edgecases_fuzzing(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_edgecases_minifuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -1307,8 +1632,8 @@ mod tests {
 
         // parent rowid, child textified integers -> MustBeInt coercion path
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1373,8 +1698,8 @@ mod tests {
 
         // slf-referential rowid FK
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1436,8 +1761,8 @@ mod tests {
 
         // self-referential UNIQUE(u,v) parent (fast-path for composite)
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1516,8 +1841,8 @@ mod tests {
 
         // parent TEXT UNIQUE(u,v), child types differ; rely on parent-index affinities
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1627,11 +1952,16 @@ mod tests {
         println!("fk_edgecases_minifuzz complete (seed {seed})");
     }
 
-    #[test]
-    pub fn fk_composite_pk_mutation_fuzz() {
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
+    pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_composite_pk_mutation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
@@ -1643,8 +1973,8 @@ mod tests {
                 OUTER_ITERS
             );
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1837,24 +2167,141 @@ mod tests {
             }
         }
     }
-
-    #[test]
+    #[turso_macros::test(mvcc)]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
-    pub fn table_index_mutation_fuzz() {
-        let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
-        println!("index_scan_single_key_mutation_fuzz seed: {seed}");
+    pub fn table_index_mutation_fuzz(db: TempDatabase) {
+        let is_mvcc = db.db_opts.enable_mvcc;
+        /// Format a nice diff between two result sets for better error messages
+        #[allow(clippy::too_many_arguments)]
+        fn format_rows_diff(
+            sqlite_rows: &[Vec<Value>],
+            limbo_rows: &[Vec<Value>],
+            seed: u64,
+            query: &str,
+            table_def: &str,
+            indexes: &[String],
+            trigger: Option<&String>,
+            dml_statements: &[String],
+        ) -> String {
+            let mut diff = String::new();
+            let sqlite_rows_len = sqlite_rows.len();
+            let limbo_rows_len = limbo_rows.len();
+            diff.push_str(&format!(
+            "\n\n=== Row Count Difference ===\nSQLite: {sqlite_rows_len} rows, Limbo: {limbo_rows_len} rows\n",
+        ));
 
-        const OUTER_ITERATIONS: usize = 100;
+            // Find rows that differ at the same index
+            let max_len = sqlite_rows.len().max(limbo_rows.len());
+            let mut diff_indices = Vec::new();
+            for i in 0..max_len {
+                let sqlite_row = sqlite_rows.get(i);
+                let limbo_row = limbo_rows.get(i);
+                if sqlite_row != limbo_row {
+                    diff_indices.push(i);
+                }
+            }
+
+            if !diff_indices.is_empty() {
+                diff.push_str("\n=== Rows Differing at Same Index (showing first 10) ===\n");
+                for &idx in diff_indices.iter().take(10) {
+                    diff.push_str(&format!("\nIndex {idx}:\n"));
+                    if let Some(sqlite_row) = sqlite_rows.get(idx) {
+                        diff.push_str(&format!("  SQLite: {sqlite_row:?}\n"));
+                    } else {
+                        diff.push_str("  SQLite: <missing>\n");
+                    }
+                    if let Some(limbo_row) = limbo_rows.get(idx) {
+                        diff.push_str(&format!("  Limbo:  {limbo_row:?}\n"));
+                    } else {
+                        diff.push_str("  Limbo:  <missing>\n");
+                    }
+                }
+                if diff_indices.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more differences\n",
+                        diff_indices.len() - 10
+                    ));
+                }
+            }
+
+            // Find rows that are in one but not the other (using linear search since Value doesn't implement Hash)
+            let mut only_in_sqlite = Vec::new();
+            for sqlite_row in sqlite_rows.iter() {
+                if !limbo_rows.iter().any(|limbo_row| limbo_row == sqlite_row) {
+                    only_in_sqlite.push(sqlite_row);
+                }
+            }
+
+            let mut only_in_limbo = Vec::new();
+            for limbo_row in limbo_rows.iter() {
+                if !sqlite_rows.iter().any(|sqlite_row| sqlite_row == limbo_row) {
+                    only_in_limbo.push(limbo_row);
+                }
+            }
+
+            if !only_in_sqlite.is_empty() {
+                diff.push_str("\n=== Rows Only in SQLite (showing first 10) ===\n");
+                for row in only_in_sqlite.iter().take(10) {
+                    diff.push_str(&format!("  {row:?}\n"));
+                }
+                if only_in_sqlite.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more rows\n",
+                        only_in_sqlite.len() - 10
+                    ));
+                }
+            }
+
+            if !only_in_limbo.is_empty() {
+                diff.push_str("\n=== Rows Only in Limbo (showing first 10) ===\n");
+                for row in only_in_limbo.iter().take(10) {
+                    diff.push_str(&format!("  {row:?}\n"));
+                }
+                if only_in_limbo.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more rows\n",
+                        only_in_limbo.len() - 10
+                    ));
+                }
+            }
+
+            diff.push_str(&format!(
+                "\n=== Context ===\nSeed: {seed}\nQuery: {query}\n",
+            ));
+
+            diff.push_str("\n=== DDL/DML to Reproduce ===\n");
+            diff.push_str(&format!("{table_def};\n"));
+            for idx in indexes.iter() {
+                diff.push_str(&format!("{idx};\n"));
+            }
+            if let Some(trigger) = trigger {
+                diff.push_str(&format!("{trigger};\n"));
+            }
+            for dml in dml_statements.iter() {
+                diff.push_str(&format!("{dml};\n"));
+            }
+
+            diff
+        }
+
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("table_index_mutation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        const OUTER_ITERATIONS: usize = 30;
         for i in 0..OUTER_ITERATIONS {
             println!(
                 "table_index_mutation_fuzz iteration {}/{}",
                 i + 1,
                 OUTER_ITERATIONS
             );
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -1866,9 +2313,42 @@ mod tests {
             let table_def = format!("CREATE TABLE t ({table_def})");
 
             let num_indexes = rng.random_range(0..=num_cols);
-            let indexes = (0..num_indexes)
-                .map(|i| format!("CREATE INDEX idx_{i} ON t(c{i})"))
-                .collect::<Vec<_>>();
+            let mut indexes = Vec::new();
+            for i in 0..num_indexes {
+                // Decide if this should be a single-column or multi-column index
+                let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
+                // Expression indexes are not supported in MVCC (at least yet)
+                let is_expr = !is_mvcc && rng.random_bool(0.3);
+
+                if is_multi_column {
+                    // Create a multi-column index with 2-3 columns
+                    let num_index_cols = rng.random_range(2..=3.min(num_cols));
+                    let mut index_cols = Vec::new();
+                    let mut available_cols: Vec<usize> = (0..num_cols).collect();
+
+                    for _ in 0..num_index_cols {
+                        let idx = rng.random_range(0..available_cols.len());
+                        let col = available_cols.remove(idx);
+                        index_cols.push(format!("c{col}"));
+                    }
+
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON t({})",
+                        index_cols.join(", ")
+                    ));
+                } else {
+                    // Single-column index
+                    let col = rng.random_range(0..num_cols);
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON {}",
+                        if is_expr {
+                            format!("t(LOWER(c{col}))")
+                        } else {
+                            format!("t(c{col})")
+                        }
+                    ));
+                }
+            }
 
             // Create tables and indexes in both databases
             let limbo_conn = limbo_db.connect_limbo();
@@ -1883,8 +2363,17 @@ mod tests {
                 sqlite_conn.execute(t, params![]).unwrap();
             }
 
+            // Triggers are not supported in MVCC (at least yet)
+            let use_trigger = !is_mvcc;
+
             // Generate initial data
-            let num_inserts = rng.random_range(10..=1000);
+            // Triggers can cause quadratic complexity to the tested operations so limit total row count
+            // whenever we have one to make the test runtime reasonable.
+            let num_inserts = if use_trigger {
+                rng.random_range(10..=100)
+            } else {
+                rng.random_range(10..=1000)
+            };
             let mut tuples = HashSet::new();
             while tuples.len() < num_inserts {
                 tuples.insert(
@@ -1910,8 +2399,15 @@ mod tests {
                 .map(|i| format!("c{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let insert_type = match rng.random_range(0..3) {
+                0 => "",
+                1 => "OR REPLACE",
+                2 => "OR IGNORE",
+                _ => unreachable!(),
+            };
             let insert = format!(
-                "INSERT INTO t ({}) VALUES {}",
+                "INSERT {} INTO t ({}) VALUES {}",
+                insert_type,
                 col_names,
                 insert_values.join(", ")
             );
@@ -1921,6 +2417,145 @@ mod tests {
             sqlite_conn.execute(&insert, params![]).unwrap();
             limbo_exec_rows(&limbo_db, &limbo_conn, &insert);
 
+            // Self-affecting triggers (e.g CREATE TRIGGER t BEFORE DELETE ON t BEGIN UPDATE t ... END) are
+            // an easy source of bugs, so create one some of the time.
+            let trigger = if use_trigger {
+                // Create a random trigger
+                let trigger_time = if rng.random_bool(0.5) {
+                    "BEFORE"
+                } else {
+                    "AFTER"
+                };
+                let trigger_event = match rng.random_range(0..3) {
+                    0 => "INSERT".to_string(),
+                    1 => {
+                        // Optionally specify columns for UPDATE trigger
+                        if rng.random_bool(0.5) {
+                            let update_col = rng.random_range(0..num_cols);
+                            format!("UPDATE OF c{update_col}")
+                        } else {
+                            "UPDATE".to_string()
+                        }
+                    }
+                    2 => "DELETE".to_string(),
+                    _ => unreachable!(),
+                };
+
+                // Determine if OLD/NEW references are available based on trigger event
+                let has_old =
+                    trigger_event.starts_with("UPDATE") || trigger_event.starts_with("DELETE");
+                let has_new =
+                    trigger_event.starts_with("UPDATE") || trigger_event.starts_with("INSERT");
+
+                // Generate trigger action (INSERT, UPDATE, or DELETE)
+                let trigger_action = match rng.random_range(0..3) {
+                    0 => {
+                        // INSERT action
+                        let values = (0..num_cols)
+                            .map(|i| {
+                                // Randomly use OLD/NEW values if available
+                                if has_old && rng.random_bool(0.3) {
+                                    format!("OLD.c{i}")
+                                } else if has_new && rng.random_bool(0.3) {
+                                    format!("NEW.c{i}")
+                                } else {
+                                    rng.random_range(0..1000).to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let insert_conflict_action = match rng.random_range(0..3) {
+                            0 => "",
+                            1 => " OR REPLACE",
+                            2 => " OR IGNORE",
+                            _ => unreachable!(),
+                        };
+                        format!(
+                            "INSERT{insert_conflict_action} INTO t ({col_names}) VALUES ({values})"
+                        )
+                    }
+                    1 => {
+                        // UPDATE action
+                        let update_col = rng.random_range(0..num_cols);
+                        let new_value = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            // Sometimes make it a function of the OLD column
+                            if rng.random_bool(0.5) {
+                                let operator = *["+", "-", "*"].choose(&mut rng).unwrap();
+                                let amount = rng.random_range(1..100);
+                                format!("OLD.c{ref_col} {operator} {amount}")
+                            } else {
+                                format!("OLD.c{ref_col}")
+                            }
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            // Sometimes make it a function of the NEW column
+                            if rng.random_bool(0.5) {
+                                let operator = *["+", "-", "*"].choose(&mut rng).unwrap();
+                                let amount = rng.random_range(1..100);
+                                format!("NEW.c{ref_col} {operator} {amount}")
+                            } else {
+                                format!("NEW.c{ref_col}")
+                            }
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        let op = match rng.random_range(0..=3) {
+                            0 => "<",
+                            1 => "<=",
+                            2 => ">",
+                            3 => ">=",
+                            _ => unreachable!(),
+                        };
+                        let threshold = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("OLD.c{ref_col}")
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("NEW.c{ref_col}")
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        format!("UPDATE t SET c{update_col} = {new_value} WHERE c{update_col} {op} {threshold}")
+                    }
+                    2 => {
+                        // DELETE action
+                        let delete_col = rng.random_range(0..num_cols);
+                        let op = match rng.random_range(0..=3) {
+                            0 => "<",
+                            1 => "<=",
+                            2 => ">",
+                            3 => ">=",
+                            _ => unreachable!(),
+                        };
+                        let threshold = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("OLD.c{ref_col}")
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("NEW.c{ref_col}")
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        format!("DELETE FROM t WHERE c{delete_col} {op} {threshold}")
+                    }
+                    _ => unreachable!(),
+                };
+
+                let create_trigger = format!(
+                    "CREATE TRIGGER test_trigger {trigger_time} {trigger_event} ON t BEGIN {trigger_action}; END;",
+                );
+
+                sqlite_conn.execute(&create_trigger, params![]).unwrap();
+                limbo_exec_rows(&limbo_db, &limbo_conn, &create_trigger);
+                Some(create_trigger)
+            } else {
+                None
+            };
+            if let Some(ref trigger) = trigger {
+                println!("{trigger};");
+            }
+
             const COMPARISONS: [&str; 3] = ["=", "<", ">"];
             const INNER_ITERATIONS: usize = 20;
 
@@ -1928,7 +2563,6 @@ mod tests {
                 let do_update = rng.random_range(0..2) == 0;
 
                 let comparison = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
-                let affected_col = rng.random_range(0..num_cols);
                 let predicate_col = rng.random_range(0..num_cols);
                 let predicate_value = rng.random_range(0..1000);
 
@@ -1952,8 +2586,23 @@ mod tests {
                 };
 
                 let query = if do_update {
-                    let new_y = rng.random_range(0..1000);
-                    format!("UPDATE t SET c{affected_col} = {new_y} {where_clause}")
+                    let affected_col = rng.random_range(0..num_cols);
+                    let num_updates = rng.random_range(1..=num_cols);
+                    let mut values = Vec::new();
+                    for _ in 0..num_updates {
+                        let new_y = if rng.random_bool(0.5) {
+                            // Update to a constant value
+                            rng.random_range(0..1000).to_string()
+                        } else {
+                            let source_col = rng.random_range(0..num_cols);
+                            // Update to a value that is a function of the another column
+                            let operator = *["+", "-"].choose(&mut rng).unwrap();
+                            let amount = rng.random_range(0..1000);
+                            format!("c{source_col} {operator} {amount}")
+                        };
+                        values.push(format!("c{affected_col} = {new_y}"));
+                    }
+                    format!("UPDATE t SET {} {where_clause}", values.join(", "))
                 } else {
                     format!("DELETE FROM t {where_clause}")
                 };
@@ -1986,10 +2635,35 @@ mod tests {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &verify_query);
                 let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &verify_query);
 
-                assert_eq!(
-                    sqlite_rows, limbo_rows,
-                    "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
-                );
+                if sqlite_rows != limbo_rows {
+                    let diff_msg = format_rows_diff(
+                        &sqlite_rows,
+                        &limbo_rows,
+                        seed,
+                        &query,
+                        &table_def,
+                        &indexes,
+                        trigger.as_ref(),
+                        &dml_statements,
+                    );
+                    panic!("Different results after mutation!{diff_msg}");
+                }
+
+                // Run integrity check on limbo db using rusqlite
+                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                    println!("{table_def};");
+                    for t in indexes.iter() {
+                        println!("{t};");
+                    }
+                    if let Some(trigger) = trigger {
+                        println!("{trigger};");
+                    }
+                    for t in dml_statements.iter() {
+                        println!("{t};");
+                    }
+                    println!("{query};");
+                    panic!("seed: {seed}, error: {e}");
+                }
 
                 if sqlite_rows.is_empty() {
                     break;
@@ -1998,27 +2672,32 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn partial_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(1.0, 4);
+    // TODO: mvcc index
+    #[turso_macros::test()]
+    pub fn partial_index_mutation_and_upsert_fuzz(db: TempDatabase) {
+        index_mutation_upsert_fuzz(db, 1.0, 4);
     }
 
-    #[test]
-    pub fn simple_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(0.0, 4);
+    // TODO: mvcc fails
+    #[turso_macros::test()]
+    pub fn simple_index_mutation_and_upsert_fuzz(db: TempDatabase) {
+        index_mutation_upsert_fuzz(db, 0.0, 4);
     }
 
-    fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
+    fn index_mutation_upsert_fuzz(
+        db: TempDatabase,
+        partial_index_prob: f64,
+        conflict_chain_max_len: u32,
+    ) {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
         const INNER_ITERS: usize = 500;
 
-        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
-            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
-            (ChaCha8Rng::seed_from_u64(seed), seed)
-        } else {
-            rng_from_time()
-        };
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        let (mut rng, seed) = rng_from_time_or_env();
         println!("partial_index_mutation_and_upsert_fuzz seed: {seed}");
         // we want to hit unique constraints fairly often so limit the insert values
         const K_POOL: [&str; 35] = [
@@ -2035,8 +2714,8 @@ mod tests {
             );
 
             // Columns: id (rowid PK), plus a few data columns we can reference in predicates/keys.
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2063,6 +2742,7 @@ mod tests {
             let mut conflict_match_targets = vec!["".to_string(), "(id)".to_string()];
             let mut idx_ddls: Vec<String> = Vec::new();
             for i in 0..num_pidx {
+                let is_expr = rng.random_bool(0.3);
                 // Pick 1 or 2 key columns; always include "k" sometimes to get frequent conflicts.
                 let mut key_cols = Vec::new();
                 if rng.random_bool(0.7) {
@@ -2130,10 +2810,25 @@ mod tests {
 
                 let ddl = if rng.random_bool(partial_index_prob) {
                     format!(
-                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON {} WHERE {}",
                         outer,
                         i,
-                        key_cols.join(","),
+                        if is_expr {
+                            format!(
+                                "t({})",
+                                key_cols
+                                    .iter()
+                                    .map(|c| format!(
+                                        "{}( {})",
+                                        functions.choose(&mut rng).unwrap(),
+                                        c
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        } else {
+                            format!("t({})", key_cols.join(","))
+                        },
                         pred
                     )
                 } else {
@@ -2174,6 +2869,22 @@ mod tests {
             }
 
             for _ in 0..INNER_ITERS {
+                // Randomly inject transaction statements -- we don't care if they are legal,
+                // we just care that tursodb/sqlite behave the same way.
+                if rng.random_bool(0.15) {
+                    let tx_stmt = match rng.random_range(0..4) {
+                        0 => "BEGIN",
+                        1 => "BEGIN IMMEDIATE",
+                        2 => "COMMIT",
+                        3 => "ROLLBACK",
+                        _ => unreachable!(),
+                    };
+                    println!("{tx_stmt};");
+                    let sqlite_res = sqlite.execute(tx_stmt, rusqlite::params![]);
+                    let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, tx_stmt);
+                    // Both should succeed or both should fail
+                    assert!(sqlite_res.is_ok() == limbo_res.is_ok());
+                }
                 let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
                 let stmt = match action {
                     // INSERT
@@ -2192,7 +2903,14 @@ mod tests {
                             }
                         }
                         format!(
-                            "INSERT INTO t({}) VALUES({})",
+                            "INSERT {} INTO t({}) VALUES({})",
+                            if rng.random_bool(0.3) {
+                                "OR REPLACE"
+                            } else if rng.random_bool(0.3) {
+                                "OR IGNORE"
+                            } else {
+                                ""
+                            },
                             cols_list.join(","),
                             vals_list.join(",")
                         )
@@ -2346,10 +3064,10 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn compound_select_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn compound_select_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("compound_select_fuzz seed: {seed}");
 
         // Constants for fuzzing parameters
@@ -2362,7 +3080,6 @@ mod tests {
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
 
-        let db = TempDatabase::new_empty(true);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2482,13 +3199,19 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn ddl_compatibility_fuzz() {
+    // TODO: indexes
+    #[turso_macros::test()]
+    pub fn ddl_compatibility_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         const ITERATIONS: usize = 1000;
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for i in 0..ITERATIONS {
-            let db = TempDatabase::new_empty(true);
+            let db = builder.clone().build();
             let conn = db.connect_limbo();
             let num_cols = rng.random_range(1..=5);
             let col_names: Vec<String> = (0..num_cols).map(|c| format!("c{c}")).collect();
@@ -2606,8 +3329,8 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn arithmetic_expression_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn arithmetic_expression_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -2650,11 +3373,10 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -2667,10 +3389,9 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_ex() {
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_ex(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2694,8 +3415,8 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn math_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn math_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -2769,11 +3490,10 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -2796,8 +3516,8 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn string_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn string_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -2929,11 +3649,10 @@ mod tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -3114,6 +3833,7 @@ mod tests {
         let number = g
             .create()
             .choice()
+            .option_symbol(rand_int(-1..2))
             .option_symbol(rand_int(-0xff..0x100))
             .option_symbol(rand_int(-0xffff..0x10000))
             .option_symbol(rand_int(-0xffffff..0x1000000))
@@ -3200,7 +3920,11 @@ mod tests {
         }
     }
 
-    fn predicate_builders(g: &GrammarGenerator, tables: Option<&[TestTable]>) -> PredicateBuilders {
+    fn predicate_builders(
+        g: &GrammarGenerator,
+        common: &CommonBuilders,
+        tables: Option<&[TestTable]>,
+    ) -> PredicateBuilders {
         let (in_op, in_op_builder) = g.create_handle();
         let (column, column_builder) = g.create_handle();
         let mut column_builder = column_builder
@@ -3213,7 +3937,7 @@ mod tests {
                     .push_str(")")
                     .build(),
             )
-            .option_symbol(rand_int(-0xffffffff..0x100000000))
+            .option(common.number)
             .option(
                 g.create()
                     .concat(" ")
@@ -3245,7 +3969,7 @@ mod tests {
                 g.create()
                     .concat("")
                     .push(column)
-                    .repeat(1..5, ", ")
+                    .repeat(1..3, ", ")
                     .build(),
             )
             .push_str(")")
@@ -3284,8 +4008,8 @@ mod tests {
         handle
     }
 
-    #[test]
-    pub fn logical_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let builders = common_builders(&g, None);
@@ -3298,11 +4022,10 @@ mod tests {
             .push(expr)
             .build();
 
-        let db = TempDatabase::new_empty(false);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
@@ -3316,9 +4039,13 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn table_logical_expression_fuzz_ex1() {
+    #[turso_macros::test(mvcc)]
+    pub fn table_logical_expression_fuzz_ex1(db: TempDatabase) {
         let _ = env_logger::try_init();
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         for queries in [
             [
@@ -3332,7 +4059,7 @@ mod tests {
                 "SELECT * FROM t",
             ],
         ] {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
             for query in queries.iter() {
@@ -3346,20 +4073,24 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn min_max_agg_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn min_max_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let datatypes = ["INTEGER", "TEXT", "REAL", "BLOB"];
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         for _ in 0..1000 {
             // Create table with random datatype
             let datatype = datatypes[rng.random_range(0..datatypes.len())];
             let create_table = format!("CREATE TABLE t (x {datatype})");
 
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3402,15 +4133,19 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn affinity_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn affinity_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("affinity_fuzz seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for iteration in 0..500 {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3502,16 +4237,20 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for SUM with floats
-    pub fn sum_agg_fuzz_floats() {
+    pub fn sum_agg_fuzz_floats(db: TempDatabase) {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3548,16 +4287,20 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for SUM with mixed numeric/non-numeric values (issue #2133)
-    pub fn sum_agg_fuzz() {
+    pub fn sum_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3593,15 +4336,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn concat_ws_fuzz() {
+    #[turso_macros::test(mvcc)]
+    fn concat_ws_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3638,16 +4385,20 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for TOTAL with mixed numeric/non-numeric values
-    pub fn total_agg_fuzz() {
+    pub fn total_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3683,8 +4434,9 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn table_logical_expression_fuzz_run() {
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
+    pub fn table_logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let tables = vec![TestTable {
@@ -3692,10 +4444,9 @@ mod tests {
             columns: vec!["x", "y", "z"],
         }];
         let builders = common_builders(&g, Some(&tables));
-        let predicate = predicate_builders(&g, Some(&tables));
+        let predicate = predicate_builders(&g, &builders, Some(&tables));
         let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
-        let db = TempDatabase::new_empty(true);
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         for table in tables.iter() {
@@ -3709,7 +4460,7 @@ mod tests {
                 "CREATE TABLE {} ({})",
                 table.name, columns_with_first_column_as_pk
             );
-            dbg!(&query);
+            log::info!("schema: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
@@ -3719,12 +4470,12 @@ mod tests {
             );
         }
 
-        let (mut rng, seed) = rng_from_time();
+        let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
         let mut i = 0;
         let mut primary_key_set = HashSet::with_capacity(100);
-        while i < 100 {
+        while i < 1000 {
             let x = g.generate(&mut rng, builders.number, 1);
             if primary_key_set.contains(&x) {
                 continue;
@@ -3753,7 +4504,15 @@ mod tests {
         let sql = g
             .create()
             .concat(" ")
-            .push_str("SELECT * FROM t WHERE ")
+            .push_str("SELECT ")
+            .push(
+                g.create()
+                    .choice()
+                    .option_str("*")
+                    .option_str("COUNT(*)")
+                    .build(),
+            )
+            .push_str(" FROM t WHERE ")
             .push(expr)
             .build();
 
@@ -3784,9 +4543,8 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_distinct() {
-        let db = TempDatabase::new_empty(true);
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_distinct(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3850,25 +4608,16 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_long_create_table_drop_table_alter_table_normal() {
-        _fuzz_long_create_table_drop_table_alter_table(false);
-    }
-
-    #[test]
-    pub fn fuzz_long_create_table_drop_table_alter_table_mvcc() {
-        _fuzz_long_create_table_drop_table_alter_table(true);
-    }
-
-    fn _fuzz_long_create_table_drop_table_alter_table(mvcc: bool) {
-        let db = TempDatabase::new_with_opts(
-            "fuzz_long_create_table_drop_table_alter_table",
-            DatabaseOpts::new().with_mvcc(mvcc).with_indexes(!mvcc),
-        );
+    #[turso_macros::test(mvcc)]
+    fn fuzz_long_create_table_drop_table_alter_table(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
+        let mvcc = db.db_opts.enable_mvcc;
+        tracing::info!(
+            "create_table_drop_table_fuzz seed: {seed}, mvcc: {}",
+            db.db_opts.enable_mvcc
+        );
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
@@ -4077,10 +4826,10 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_macros::test()]
     #[cfg(feature = "test_helper")]
-    pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
-        use crate::common::rusqlite_integrity_check;
+    pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
+        use core_tester::common::rusqlite_integrity_check;
 
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -4094,6 +4843,10 @@ mod tests {
 
         const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..10 {
             // generate a random pending page that is smaller than the 100 MB mark
 
@@ -4105,7 +4858,7 @@ mod tests {
             let db_path = tempfile::NamedTempFile::new()?;
 
             {
-                let db = TempDatabase::new_with_existent(db_path.path(), true);
+                let db = builder.clone().with_db_path(db_path.path()).build();
 
                 let prev_pending_byte = TempDatabase::get_pending_byte();
                 tracing::debug!(prev_pending_byte);
@@ -4133,5 +4886,949 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
+    /// Tests for correlated and uncorrelated subqueries occurring in the WHERE clause of a SELECT statement.
+    pub fn table_subquery_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("table_subquery_fuzz seed: {seed}");
+
+        // Constants for fuzzing parameters
+        const NUM_FUZZ_ITERATIONS: usize = 2000;
+        const MAX_ROWS_PER_TABLE: usize = 100;
+        const MIN_ROWS_PER_TABLE: usize = 5;
+        const MAX_SUBQUERY_DEPTH: usize = 4;
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create 3 simple tables
+        let table_schemas = [
+            "CREATE TABLE t1 (id INT PRIMARY KEY, value1 INTEGER, value2 INTEGER);",
+            "CREATE TABLE t2 (id INT PRIMARY KEY, ref_id INTEGER, data INTEGER);",
+            "CREATE TABLE t3 (id INT PRIMARY KEY, category INTEGER, amount INTEGER);",
+        ];
+
+        for schema in &table_schemas {
+            debug_ddl_dml_string.push_str(schema);
+            limbo_exec_rows(&db, &limbo_conn, schema);
+            sqlite_exec_rows(&sqlite_conn, schema);
+        }
+
+        // Populate tables with random data
+        for table_num in 1..=3 {
+            let num_rows = rng.random_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
+            for i in 1..=num_rows {
+                let insert_sql = match table_num {
+                    1 => format!(
+                        "INSERT INTO t1 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(-10..20),
+                        rng.random_range(-5..15)
+                    ),
+                    2 => format!(
+                        "INSERT INTO t2 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(1..=num_rows), // ref_id references t1 approximately
+                        rng.random_range(-5..10)
+                    ),
+                    3 => format!(
+                        "INSERT INTO t3 VALUES ({}, {}, {});",
+                        i,
+                        rng.random_range(1..5), // category 1-4
+                        rng.random_range(0..100)
+                    ),
+                    _ => unreachable!(),
+                };
+                log::debug!("{insert_sql}");
+                debug_ddl_dml_string.push_str(&insert_sql);
+                limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                sqlite_exec_rows(&sqlite_conn, &insert_sql);
+            }
+        }
+
+        log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
+
+        // Helper function to generate random simple WHERE condition
+        let gen_simple_where = |rng: &mut ChaCha8Rng, table: &str| -> String {
+            let conditions = match table {
+                "t1" => vec![
+                    format!("value1 > {}", rng.random_range(-5..15)),
+                    format!("value2 < {}", rng.random_range(-5..15)),
+                    format!("id <= {}", rng.random_range(1..20)),
+                    "value1 IS NOT NULL".to_string(),
+                ],
+                "t2" => vec![
+                    format!("data > {}", rng.random_range(-3..8)),
+                    format!("ref_id = {}", rng.random_range(1..15)),
+                    format!("id < {}", rng.random_range(5..25)),
+                    "data IS NOT NULL".to_string(),
+                ],
+                "t3" => vec![
+                    format!("category = {}", rng.random_range(1..5)),
+                    format!("amount > {}", rng.random_range(0..50)),
+                    format!("id <= {}", rng.random_range(1..20)),
+                    "amount IS NOT NULL".to_string(),
+                ],
+                _ => vec!["1=1".to_string()],
+            };
+            conditions[rng.random_range(0..conditions.len())].clone()
+        };
+
+        // Helper function to generate simple subquery
+        fn gen_subquery(
+            rng: &mut ChaCha8Rng,
+            depth: usize,
+            outer_table: Option<&str>,
+            allowed_outer_cols: Option<&[&str]>,
+        ) -> String {
+            if depth > MAX_SUBQUERY_DEPTH {
+                return "SELECT 1".to_string();
+            }
+
+            let gen_simple_where_inner = |rng: &mut ChaCha8Rng, table: &str| -> String {
+                let conditions = match table {
+                    "t1" => vec![
+                        format!("value1 > {}", rng.random_range(-5..15)),
+                        format!("value2 < {}", rng.random_range(-5..15)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "value1 IS NOT NULL".to_string(),
+                    ],
+                    "t2" => vec![
+                        format!("data > {}", rng.random_range(-3..8)),
+                        format!("ref_id = {}", rng.random_range(1..15)),
+                        format!("id < {}", rng.random_range(5..25)),
+                        "data IS NOT NULL".to_string(),
+                    ],
+                    "t3" => vec![
+                        format!("category = {}", rng.random_range(1..5)),
+                        format!("amount > {}", rng.random_range(0..50)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "amount IS NOT NULL".to_string(),
+                    ],
+                    _ => vec!["1=1".to_string()],
+                };
+                conditions[rng.random_range(0..conditions.len())].clone()
+            };
+
+            // Helper function to generate correlated WHERE conditions
+            let gen_correlated_where =
+                |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    let pick =
+                        |rng: &mut ChaCha8Rng, mut candidates: Vec<(String, &'static str)>| {
+                            let filtered: Vec<String> = if let Some(allowed) = allowed_outer_cols {
+                                candidates
+                                    .drain(..)
+                                    .filter(|(_, col)| allowed.contains(col))
+                                    .map(|(cond, _)| cond)
+                                    .collect()
+                            } else {
+                                candidates.drain(..).map(|(cond, _)| cond).collect()
+                            };
+                            if filtered.is_empty() {
+                                "1=1".to_string()
+                            } else {
+                                filtered[rng.random_range(0..filtered.len())].clone()
+                            }
+                        };
+                    match (outer_table, inner_table) {
+                        ("t1", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.ref_id = {outer_table}.id"), "id"),
+                                (format!("{inner_table}.id < {outer_table}.value1"), "value1"),
+                                (
+                                    format!("{inner_table}.data > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t1", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category < {outer_table}.value1"),
+                                    "value1",
+                                ),
+                                (
+                                    format!("{inner_table}.amount > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t2", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.ref_id"), "ref_id"),
+                                (format!("{inner_table}.value1 > {outer_table}.data"), "data"),
+                                (format!("{inner_table}.value2 < {outer_table}.id"), "id"),
+                            ],
+                        ),
+                        ("t2", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category = {outer_table}.ref_id"),
+                                    "ref_id",
+                                ),
+                                (format!("{inner_table}.amount > {outer_table}.data"), "data"),
+                            ],
+                        ),
+                        ("t3", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.value1 > {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.value2 < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        ("t3", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.ref_id = {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.data < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        _ => "1=1".to_string(),
+                    }
+                };
+
+            let subquery_types = [
+                // Simple scalar subqueries - single column only for safe nesting
+                "SELECT MAX(amount) FROM t3".to_string(),
+                "SELECT MIN(value1) FROM t1".to_string(),
+                "SELECT COUNT(*) FROM t2".to_string(),
+                "SELECT AVG(amount) FROM t3".to_string(),
+                "SELECT id FROM t1".to_string(),
+                "SELECT ref_id FROM t2".to_string(),
+                "SELECT category FROM t3".to_string(),
+                // Subqueries with WHERE - single column only
+                format!(
+                    "SELECT MAX(amount) FROM t3 WHERE {}",
+                    gen_simple_where_inner(rng, "t3")
+                ),
+                format!(
+                    "SELECT value1 FROM t1 WHERE {}",
+                    gen_simple_where_inner(rng, "t1")
+                ),
+                format!(
+                    "SELECT ref_id FROM t2 WHERE {}",
+                    gen_simple_where_inner(rng, "t2")
+                ),
+            ];
+
+            let base_query = &subquery_types[rng.random_range(0..subquery_types.len())];
+
+            // Add correlated conditions if outer_table is provided and sometimes
+            let final_query = if let Some(outer_table) = outer_table {
+                let can_correlate = match allowed_outer_cols {
+                    Some(cols) => !cols.is_empty(),
+                    None => true,
+                };
+                if can_correlate && rng.random_bool(0.4) {
+                    // 40% chance for correlation
+                    // Extract the inner table from the base query
+                    let inner_table = if base_query.contains("FROM t1") {
+                        "t1"
+                    } else if base_query.contains("FROM t2") {
+                        "t2"
+                    } else if base_query.contains("FROM t3") {
+                        "t3"
+                    } else {
+                        return base_query.clone(); // fallback
+                    };
+
+                    let correlated_condition = gen_correlated_where(rng, inner_table, outer_table);
+
+                    if base_query.contains("WHERE") {
+                        format!("{base_query} AND {correlated_condition}")
+                    } else {
+                        format!("{base_query} WHERE {correlated_condition}")
+                    }
+                } else {
+                    base_query.clone()
+                }
+            } else {
+                base_query.clone()
+            };
+
+            // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols);
+                if final_query.contains("WHERE") {
+                    format!("{final_query} AND id IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE id IN ({nested})")
+                }
+            } else {
+                final_query
+            }
+        }
+
+        // Helper function to generate scalar subquery (single column only)
+        fn gen_scalar_subquery(
+            rng: &mut ChaCha8Rng,
+            depth: usize,
+            outer_table: Option<&str>,
+            allowed_outer_cols: Option<&[&str]>,
+        ) -> String {
+            if depth > MAX_SUBQUERY_DEPTH {
+                // Reduced nesting depth
+                return "SELECT 1".to_string();
+            }
+
+            let gen_simple_where_inner = |rng: &mut ChaCha8Rng, table: &str| -> String {
+                let conditions = match table {
+                    "t1" => vec![
+                        format!("value1 > {}", rng.random_range(-5..15)),
+                        format!("value2 < {}", rng.random_range(-5..15)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "value1 IS NOT NULL".to_string(),
+                    ],
+                    "t2" => vec![
+                        format!("data > {}", rng.random_range(-3..8)),
+                        format!("ref_id = {}", rng.random_range(1..15)),
+                        format!("id < {}", rng.random_range(5..25)),
+                        "data IS NOT NULL".to_string(),
+                    ],
+                    "t3" => vec![
+                        format!("category = {}", rng.random_range(1..5)),
+                        format!("amount > {}", rng.random_range(0..50)),
+                        format!("id <= {}", rng.random_range(1..20)),
+                        "amount IS NOT NULL".to_string(),
+                    ],
+                    _ => vec!["1=1".to_string()],
+                };
+                conditions[rng.random_range(0..conditions.len())].clone()
+            };
+
+            // Helper function to generate correlated WHERE conditions
+            let gen_correlated_where =
+                |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    let pick =
+                        |rng: &mut ChaCha8Rng, mut candidates: Vec<(String, &'static str)>| {
+                            let filtered: Vec<String> = if let Some(allowed) = allowed_outer_cols {
+                                candidates
+                                    .drain(..)
+                                    .filter(|(_, col)| allowed.contains(col))
+                                    .map(|(cond, _)| cond)
+                                    .collect()
+                            } else {
+                                candidates.drain(..).map(|(cond, _)| cond).collect()
+                            };
+                            if filtered.is_empty() {
+                                "1=1".to_string()
+                            } else {
+                                filtered[rng.random_range(0..filtered.len())].clone()
+                            }
+                        };
+                    match (outer_table, inner_table) {
+                        ("t1", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.ref_id = {outer_table}.id"), "id"),
+                                (format!("{inner_table}.id < {outer_table}.value1"), "value1"),
+                                (
+                                    format!("{inner_table}.data > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t1", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category < {outer_table}.value1"),
+                                    "value1",
+                                ),
+                                (
+                                    format!("{inner_table}.amount > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t2", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.ref_id"), "ref_id"),
+                                (format!("{inner_table}.value1 > {outer_table}.data"), "data"),
+                                (format!("{inner_table}.value2 < {outer_table}.id"), "id"),
+                            ],
+                        ),
+                        ("t2", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category = {outer_table}.ref_id"),
+                                    "ref_id",
+                                ),
+                                (format!("{inner_table}.amount > {outer_table}.data"), "data"),
+                            ],
+                        ),
+                        ("t3", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.value1 > {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.value2 < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        ("t3", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.ref_id = {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.data < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        _ => "1=1".to_string(),
+                    }
+                };
+
+            let scalar_subquery_types = [
+                // Only scalar subqueries - single column only
+                "SELECT MAX(amount) FROM t3".to_string(),
+                "SELECT MIN(value1) FROM t1".to_string(),
+                "SELECT COUNT(*) FROM t2".to_string(),
+                "SELECT AVG(amount) FROM t3".to_string(),
+                "SELECT id FROM t1".to_string(),
+                "SELECT ref_id FROM t2".to_string(),
+                "SELECT category FROM t3".to_string(),
+                // Scalar subqueries with WHERE
+                format!(
+                    "SELECT MAX(amount) FROM t3 WHERE {}",
+                    gen_simple_where_inner(rng, "t3")
+                ),
+                format!(
+                    "SELECT value1 FROM t1 WHERE {}",
+                    gen_simple_where_inner(rng, "t1")
+                ),
+                format!(
+                    "SELECT ref_id FROM t2 WHERE {}",
+                    gen_simple_where_inner(rng, "t2")
+                ),
+            ];
+
+            let base_query =
+                &scalar_subquery_types[rng.random_range(0..scalar_subquery_types.len())];
+
+            // Add correlated conditions if outer_table is provided and sometimes
+            let final_query = if let Some(outer_table) = outer_table {
+                let can_correlate = match allowed_outer_cols {
+                    Some(cols) => !cols.is_empty(),
+                    None => true,
+                };
+                if can_correlate && rng.random_bool(0.4) {
+                    // 40% chance for correlation
+                    // Extract the inner table from the base query
+                    let inner_table = if base_query.contains("FROM t1") {
+                        "t1"
+                    } else if base_query.contains("FROM t2") {
+                        "t2"
+                    } else if base_query.contains("FROM t3") {
+                        "t3"
+                    } else {
+                        return base_query.clone(); // fallback
+                    };
+
+                    let correlated_condition = gen_correlated_where(rng, inner_table, outer_table);
+
+                    if base_query.contains("WHERE") {
+                        format!("{base_query} AND {correlated_condition}")
+                    } else {
+                        format!("{base_query} WHERE {correlated_condition}")
+                    }
+                } else {
+                    base_query.clone()
+                }
+            } else {
+                base_query.clone()
+            };
+
+            // Sometimes add nesting
+            if depth < 1 && rng.random_bool(0.2) {
+                // Reduced probability and depth
+                let nested = gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols);
+                if final_query.contains("WHERE") {
+                    format!("{final_query} AND id IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE id IN ({nested})")
+                }
+            } else {
+                final_query
+            }
+        }
+
+        // Helper to generate a SELECT-list expression as a scalar subquery, optionally correlated
+        fn gen_selectlist_scalar_expr(rng: &mut ChaCha8Rng, outer_table: &str) -> String {
+            // Reuse scalar subquery generator; return the inner SELECT (without wrapping)
+            gen_scalar_subquery(rng, 0, Some(outer_table), None)
+        }
+
+        // Helper to generate a GROUP BY expression which may include a correlated scalar subquery
+        fn gen_group_by_expr(rng: &mut ChaCha8Rng, main_table: &str) -> String {
+            // Either a plain column or a correlated scalar subquery
+            if rng.random_bool(0.4) {
+                // Prefer plain columns most of the time to keep GROUP BY semantics simple
+                match main_table {
+                    "t1" => ["id", "value1", "value2"][rng.random_range(0..3)].to_string(),
+                    "t2" => ["id", "ref_id", "data"][rng.random_range(0..3)].to_string(),
+                    "t3" => ["id", "category", "amount"][rng.random_range(0..3)].to_string(),
+                    _ => "id".to_string(),
+                }
+            } else {
+                // If GROUP BY is present, a subquery that references outer columns would be invalid
+                // unless it only references GROUP BY columns; since this subquery becomes the
+                // grouping expression itself, disallow correlation entirely here.
+                format!(
+                    "({})",
+                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]))
+                )
+            }
+        }
+
+        // Helper to generate a HAVING condition comparing an aggregate to a scalar subquery
+        fn gen_having_condition(rng: &mut ChaCha8Rng, main_table: &str) -> String {
+            let (agg_func, agg_col) = match main_table {
+                "t1" => [
+                    ("SUM", "value1"),
+                    ("SUM", "value2"),
+                    ("MAX", "value1"),
+                    ("MAX", "value2"),
+                    ("MIN", "value1"),
+                    ("MIN", "value2"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..7)],
+                "t2" => [
+                    ("SUM", "data"),
+                    ("MAX", "data"),
+                    ("MIN", "data"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..4)],
+                "t3" => [
+                    ("SUM", "amount"),
+                    ("MAX", "amount"),
+                    ("MIN", "amount"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..4)],
+                _ => ("COUNT", "*"),
+            };
+            let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]));
+            if agg_col == "*" {
+                format!("COUNT(*) {op} ({rhs})")
+            } else {
+                format!("{agg_func}({agg_col}) {op} ({rhs})")
+            }
+        }
+
+        // Helper to generate LIMIT/OFFSET clause (optionally empty). Expressions may be subqueries.
+        fn gen_limit_offset_clause(rng: &mut ChaCha8Rng) -> String {
+            // 50% of the time, no LIMIT/OFFSET
+            if rng.random_bool(0.5) {
+                return String::new();
+            }
+
+            fn gen_limit_like_expr(rng: &mut ChaCha8Rng) -> String {
+                // Small literal or a scalar subquery from a random table
+                if rng.random_bool(0.6) {
+                    // Keep literal sizes modest
+                    format!("{}", rng.random_range(0..20))
+                } else {
+                    let which = rng.random_range(0..3);
+                    match which {
+                        0 => "(SELECT COUNT(*) FROM t1)".to_string(),
+                        1 => "(SELECT COUNT(*) FROM t2)".to_string(),
+                        _ => "(SELECT COUNT(*) FROM t3)".to_string(),
+                    }
+                }
+            }
+
+            let mut clause = String::new();
+            let limit_expr = gen_limit_like_expr(rng);
+            clause.push_str(&format!(" LIMIT {limit_expr}",));
+            if rng.random_bool(0.5) {
+                let offset_expr = gen_limit_like_expr(rng);
+                clause.push_str(&format!(" OFFSET {offset_expr}",));
+            }
+            clause
+        }
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let main_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
+
+            let query_type = rng.random_range(0..8); // Add GROUP BY/HAVING variants
+            let mut query = match query_type {
+                0 => {
+                    // Comparison subquery: WHERE column <op> (SELECT ...)
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    format!("SELECT * FROM {main_table} WHERE {column} {op} ({subquery})",)
+                }
+                1 => {
+                    // EXISTS subquery: WHERE [NOT] EXISTS (SELECT ...)
+                    let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let subquery = gen_subquery(&mut rng, 0, Some(main_table), None);
+                    format!("SELECT * FROM {main_table} WHERE {not_exists}EXISTS ({subquery})",)
+                }
+                2 => {
+                    // IN subquery with single column: WHERE column [NOT] IN (SELECT ...)
+                    let not_in = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    format!("SELECT * FROM {main_table} WHERE {column} {not_in}IN ({subquery})",)
+                }
+                3 => {
+                    // IN subquery with tuple: WHERE (col1, col2) [NOT] IN (SELECT col1, col2 ...)
+                    let not_in = if rng.random_bool(0.3) { "NOT " } else { "" };
+                    let (columns, sub_columns) = match main_table {
+                        "t1" => {
+                            if rng.random_bool(0.5) {
+                                ("(id, value1)", "SELECT id, value1 FROM t1")
+                            } else {
+                                ("id", "SELECT id FROM t1")
+                            }
+                        }
+                        "t2" => {
+                            if rng.random_bool(0.5) {
+                                ("(ref_id, data)", "SELECT ref_id, data FROM t2")
+                            } else {
+                                ("ref_id", "SELECT ref_id FROM t2")
+                            }
+                        }
+                        "t3" => {
+                            if rng.random_bool(0.5) {
+                                ("(id, category)", "SELECT id, category FROM t3")
+                            } else {
+                                ("id", "SELECT id FROM t3")
+                            }
+                        }
+                        _ => ("id", "SELECT id FROM t1"),
+                    };
+                    let subquery = if rng.random_bool(0.5) {
+                        sub_columns.to_string()
+                    } else {
+                        let base = sub_columns;
+                        let table_for_where = base.split("FROM ").nth(1).unwrap_or("t1");
+                        format!(
+                            "{} WHERE {}",
+                            base,
+                            gen_simple_where(&mut rng, table_for_where)
+                        )
+                    };
+                    format!("SELECT * FROM {main_table} WHERE {columns} {not_in}IN ({subquery})",)
+                }
+                4 => {
+                    // Correlated EXISTS subquery: WHERE [NOT] EXISTS (SELECT ... WHERE correlation)
+                    let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
+
+                    // Choose a different table for the subquery to ensure correlation is meaningful
+                    let inner_tables = match main_table {
+                        "t1" => ["t2", "t3"],
+                        "t2" => ["t1", "t3"],
+                        "t3" => ["t1", "t2"],
+                        _ => ["t1", "t2"],
+                    };
+                    let inner_table = inner_tables[rng.random_range(0..inner_tables.len())];
+
+                    // Generate correlated condition
+                    let correlated_condition = match (main_table, inner_table) {
+                        ("t1", "t2") => {
+                            let conditions = [
+                                format!("{inner_table}.ref_id = {main_table}.id"),
+                                format!("{inner_table}.id < {main_table}.value1"),
+                                format!("{inner_table}.data > {main_table}.value2"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.category < {main_table}.value1"),
+                                format!("{inner_table}.amount > {main_table}.value2"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.ref_id"),
+                                format!("{inner_table}.value1 > {main_table}.data"),
+                                format!("{inner_table}.value2 < {main_table}.id"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.category = {main_table}.ref_id"),
+                                format!("{inner_table}.amount > {main_table}.data"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.value1 > {main_table}.category"),
+                                format!("{inner_table}.value2 < {main_table}.amount"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.ref_id = {main_table}.category"),
+                                format!("{inner_table}.data < {main_table}.amount"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    };
+
+                    format!(
+                        "SELECT * FROM {main_table} WHERE {not_exists}EXISTS (SELECT 1 FROM {inner_table} WHERE {correlated_condition})",
+                    )
+                }
+                5 => {
+                    // Correlated comparison subquery: WHERE column <op> (SELECT ... WHERE correlation)
+                    let column = match main_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+                    let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+
+                    // Choose a different table for the subquery
+                    let inner_tables = match main_table {
+                        "t1" => ["t2", "t3"],
+                        "t2" => ["t1", "t3"],
+                        "t3" => ["t1", "t2"],
+                        _ => ["t1", "t2"],
+                    };
+                    let inner_table = inner_tables[rng.random_range(0..inner_tables.len())];
+
+                    // Choose what to select from inner table
+                    let select_column = match inner_table {
+                        "t1" => ["value1", "value2", "id"][rng.random_range(0..3)],
+                        "t2" => ["data", "ref_id", "id"][rng.random_range(0..3)],
+                        "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
+                        _ => "id",
+                    };
+
+                    // Generate correlated condition
+                    let correlated_condition = match (main_table, inner_table) {
+                        ("t1", "t2") => {
+                            let conditions = [
+                                format!("{inner_table}.ref_id = {main_table}.id"),
+                                format!("{inner_table}.id < {main_table}.value1"),
+                                format!("{inner_table}.data > {main_table}.value2"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t1", "t3") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.category < {main_table}.value1"),
+                                format!("{inner_table}.amount > {main_table}.value2"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t1") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.ref_id"),
+                                format!("{inner_table}.value1 > {main_table}.data"),
+                                format!("{inner_table}.value2 < {main_table}.id"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t2", "t3") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.category = {main_table}.ref_id"),
+                                format!("{inner_table}.amount > {main_table}.data"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t1") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.value1 > {main_table}.category"),
+                                format!("{inner_table}.value2 < {main_table}.amount"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        ("t3", "t2") => {
+                            let conditions = [
+                                format!("{inner_table}.id = {main_table}.id"),
+                                format!("{inner_table}.ref_id = {main_table}.category"),
+                                format!("{inner_table}.data < {main_table}.amount"),
+                            ];
+                            conditions[rng.random_range(0..conditions.len())].clone()
+                        }
+                        _ => "1=1".to_string(),
+                    };
+
+                    format!(
+                        "SELECT * FROM {main_table} WHERE {column} {op} (SELECT {select_column} FROM {inner_table} WHERE {correlated_condition})",
+                    )
+                }
+                6 => {
+                    // Aggregated query with GROUP BY and optional HAVING; allow subqueries in GROUP BY/HAVING
+                    let group_expr = gen_group_by_expr(&mut rng, main_table);
+                    let (agg_func, agg_col) = match main_table {
+                        "t1" => [
+                            ("SUM", "value1"),
+                            ("SUM", "value2"),
+                            ("MAX", "value1"),
+                            ("MAX", "value2"),
+                            ("COUNT", "*"),
+                        ][rng.random_range(0..5)],
+                        "t2" => [("SUM", "data"), ("MAX", "data"), ("COUNT", "*")]
+                            [rng.random_range(0..3)],
+                        "t3" => [("SUM", "amount"), ("MAX", "amount"), ("COUNT", "*")]
+                            [rng.random_range(0..3)],
+                        _ => ("COUNT", "*"),
+                    };
+                    let mut q;
+                    if agg_col == "*" {
+                        q = format!("SELECT {group_expr} AS g, COUNT(*) AS c FROM {main_table}");
+                    } else {
+                        q = format!("SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}");
+                    }
+                    if rng.random_bool(0.5) {
+                        q.push_str(&format!(
+                            " WHERE {}",
+                            gen_simple_where(&mut rng, main_table)
+                        ));
+                    }
+                    q.push_str(&format!(" GROUP BY {group_expr}"));
+                    if rng.random_bool(0.4) {
+                        q.push_str(&format!(
+                            " HAVING {}",
+                            gen_having_condition(&mut rng, main_table)
+                        ));
+                    }
+                    q
+                }
+                7 => {
+                    // Simple GROUP BY without HAVING (baseline support); may use subquery in GROUP BY
+                    let group_expr = gen_group_by_expr(&mut rng, main_table);
+                    let select_expr = if rng.random_bool(0.5) {
+                        // Use aggregate
+                        match main_table {
+                            "t1" => "SUM(value1) AS s".to_string(),
+                            "t2" => "SUM(data) AS s".to_string(),
+                            _ => "SUM(amount) AS s".to_string(),
+                        }
+                    } else {
+                        "COUNT(*) AS c".to_string()
+                    };
+                    let mut q =
+                        format!("SELECT {group_expr} AS g, {select_expr} FROM {main_table}");
+                    if rng.random_bool(0.5) {
+                        q.push_str(&format!(
+                            " WHERE {}",
+                            gen_simple_where(&mut rng, main_table)
+                        ));
+                    }
+                    q.push_str(&format!(" GROUP BY {group_expr}"));
+                    q
+                }
+                _ => unreachable!(),
+            };
+            // Optionally inject a SELECT-list scalar subquery into non-aggregated SELECT * queries
+            if query.starts_with("SELECT * FROM ") && rng.random_bool(0.4) {
+                let sel_expr = gen_selectlist_scalar_expr(&mut rng, main_table);
+                let replacement = "SELECT *, (".to_string() + &sel_expr + ") AS s_sub FROM ";
+                query = query.replacen("SELECT * FROM ", &replacement, 1);
+            }
+
+            // Optionally append LIMIT/OFFSET (with or without subqueries)
+            let limit_clause = gen_limit_offset_clause(&mut rng);
+            if !limit_clause.is_empty() {
+                query.push_str(&limit_clause);
+            }
+
+            log::info!(
+                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                iter_num + 1,
+            );
+
+            let limbo_results = limbo_exec_rows(&db, &limbo_conn, &query);
+            let sqlite_results = sqlite_exec_rows(&sqlite_conn, &query);
+
+            // Check if results match
+            if limbo_results.len() != sqlite_results.len() {
+                panic!(
+                    "Row count mismatch for query: {}\nLimbo: {} rows, SQLite: {} rows\nLimbo: {:?}\nSQLite: {:?}\nSeed: {}\n\n DDL/DML to reproduce manually:\n{}",
+                    query, limbo_results.len(), sqlite_results.len(), limbo_results, sqlite_results, seed, debug_ddl_dml_string
+                );
+            }
+
+            // Check if all rows match (order might be different)
+            // Since Value doesn't implement Ord, we'll check containment both ways
+            let all_limbo_in_sqlite = limbo_results.iter().all(|limbo_row| {
+                sqlite_results
+                    .iter()
+                    .any(|sqlite_row| limbo_row == sqlite_row)
+            });
+            let all_sqlite_in_limbo = sqlite_results.iter().all(|sqlite_row| {
+                limbo_results
+                    .iter()
+                    .any(|limbo_row| sqlite_row == limbo_row)
+            });
+
+            if !all_limbo_in_sqlite || !all_sqlite_in_limbo {
+                panic!(
+                    "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\nSeed: {seed}",
+                );
+            }
+        }
     }
 }

@@ -1,16 +1,16 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
 use std::panic;
-use turso_core::Row;
+use turso_core::{DatabaseOpts, Row};
 
 const ENABLE_ENCRYPTION: bool = true;
 
-#[test]
-fn test_per_page_encryption() -> anyhow::Result<()> {
+// TODO: mvcc does not error here
+#[turso_macros::test]
+fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let db_name = format!("test-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
     let db_path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
 
     {
         let conn = tmp_db.connect_limbo();
@@ -46,8 +46,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -62,8 +61,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
         run_query(
             &tmp_db,
             &conn,
@@ -77,8 +75,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
         run_query(
             &tmp_db,
             &conn,
@@ -100,8 +97,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
         }));
@@ -114,8 +110,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         //test connecting to encrypted db using insufficient encryption parameters in URI.This should panic.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
-                .unwrap();
+            turso_core::Connection::from_uri(&uri, opts).unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -128,8 +123,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             db_path.to_str().unwrap()
         );
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
-                .unwrap();
+            turso_core::Connection::from_uri(&uri, opts).unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -151,11 +145,9 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc)]
+fn test_non_4k_page_size_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let db_name = format!("test-8k-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
     let db_path = tmp_db.path.clone();
 
     {
@@ -195,8 +187,10 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+        )?;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
             assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
@@ -206,12 +200,13 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
+// TODO: mvcc for some reason does not error on corruption here
+#[turso_macros::test]
+fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let db_name = format!("test-corruption-magic-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
     let db_path = tmp_db.path.clone();
+
+    let opts = tmp_db.db_opts;
 
     {
         let conn = tmp_db.connect_limbo();
@@ -254,15 +249,7 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
         );
 
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let (_io, conn) = turso_core::Connection::from_uri(
-                &uri,
-                true,
-                false,
-                false,
-                false,
-                ENABLE_ENCRYPTION,
-            )
-            .unwrap();
+            let (_io, conn) = turso_core::Connection::from_uri(&uri, opts).unwrap();
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
         }));
 
@@ -275,11 +262,9 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc)]
+fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let db_name = format!("test-corruption-ad-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
     let db_path = tmp_db.path.clone();
 
     {
@@ -313,7 +298,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
             corrupt_pos,
             rng().next_u32()
         );
-        let test_tmp_db = TempDatabase::new(&test_db_name, false);
+        let test_tmp_db = TempDatabase::new(&test_db_name);
         let test_db_path = test_tmp_db.path.clone();
         std::fs::copy(&db_path, &test_db_path)?;
 
@@ -348,11 +333,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
             let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 let (_io, conn) = turso_core::Connection::from_uri(
                     &uri,
-                    true,
-                    false,
-                    false,
-                    false,
-                    ENABLE_ENCRYPTION,
+                    DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
                 )
                 .unwrap();
                 run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})
@@ -369,8 +350,8 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_turso_header_structure() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc)]
+fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let verify_header =
@@ -453,10 +434,14 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
             "b1bbfda4f589dc9daaf004fe21111e00",
         ),
     ];
+    let opts = db.db_opts;
+    let flags = db.db_flags;
 
     for (cipher_name, expected_id, description, hexkey) in test_cases {
-        let db_name = format!("test-header-{}-{}.db", cipher_name, rng().next_u32());
-        let tmp_db = TempDatabase::new(&db_name, false);
+        let tmp_db = TempDatabase::builder()
+            .with_opts(opts)
+            .with_flags(flags)
+            .build();
         let db_path = tmp_db.path.clone();
 
         {

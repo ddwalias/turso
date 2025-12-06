@@ -1,19 +1,20 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
-
 use crate::{
     schema::{Column, Index},
     translate::{
         collate::get_collseq_from_expr,
-        expr::as_binary_components,
-        plan::{JoinOrderMember, TableReferences, WhereTerm},
+        expr::{as_binary_components, comparison_affinity},
+        expression_index::normalize_expr_for_index_matching,
+        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
+    vdbe::affinity::Affinity,
     Result,
+};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -28,9 +29,9 @@ use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
 /// and to determine the optimal join order. A constraint can only be applied if all tables
 /// referenced in its expression (other than the constrained table itself) are already
 /// available in the current join context, i.e. on the left side in the join order
-/// relative to the table.
+/// relative to the table. Expression indexes are represented by leaving `table_col_pos` empty
+/// and storing the indexed expression in `expr`.
 #[derive(Debug, Clone)]
-///
 pub struct Constraint {
     /// The position of the original `WHERE` clause term this constraint derives from,
     /// and which side of the [ast::Expr::Binary] comparison contains the expression
@@ -46,7 +47,10 @@ pub struct Constraint {
     /// The comparison operator (e.g., `=`, `>`, `<`) used in the constraint.
     pub operator: ast::Operator,
     /// The zero-based index of the constrained column within the table's schema.
-    pub table_col_pos: usize,
+    /// None for expression-index constraints.
+    pub table_col_pos: Option<usize>,
+    /// The expression constrained by this constraint, if it is not a simple column reference.
+    pub expr: Option<ast::Expr>,
     /// A bitmask representing the set of tables that appear on the *constraining* side
     /// of the comparison expression. For example, in SELECT * FROM t1,t2,t3 WHERE t1.x = t2.x + t3.x,
     /// the lhs_mask contains t2 and t3. Thus, this constraint can only be used if t2 and t3
@@ -68,16 +72,31 @@ pub enum BinaryExprSide {
 
 impl Constraint {
     /// Get the constraining expression and operator, e.g. ('>=', '2+3') from 't.x >= 2+3'
-    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> (ast::Operator, ast::Expr) {
+    pub fn get_constraining_expr(
+        &self,
+        where_clause: &[WhereTerm],
+        referenced_tables: Option<&TableReferences>,
+    ) -> (ast::Operator, ast::Expr, Affinity) {
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             panic!("Expected a valid binary expression");
         };
+        let mut affinity = Affinity::Blob;
+        if op.is_comparison() && self.table_col_pos.is_some() {
+            affinity = comparison_affinity(lhs, rhs, referenced_tables);
+        }
+
         if side == BinaryExprSide::Lhs {
-            (self.operator, lhs.clone())
+            if affinity.expr_needs_no_affinity_change(lhs) {
+                affinity = Affinity::Blob;
+            }
+            (self.operator, lhs.clone(), affinity)
         } else {
-            (self.operator, rhs.clone())
+            if affinity.expr_needs_no_affinity_change(rhs) {
+                affinity = Affinity::Blob;
+            }
+            (self.operator, rhs.clone(), affinity)
         }
     }
 
@@ -162,10 +181,10 @@ const SELECTIVITY_OTHER: f64 = 0.9;
 const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
 
 /// Estimate the selectivity of a constraint based on the operator and the column type.
-fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
+fn estimate_selectivity(column: Option<&Column>, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_rowid_alias || column.primary_key {
+            if column.is_some_and(|c| c.is_rowid_alias() || c.primary_key()) {
                 SELECTIVITY_UNIQUE_EQUALITY
             } else {
                 SELECTIVITY_EQ
@@ -179,6 +198,22 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
     }
 }
 
+fn expression_matches_table(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> bool {
+    match table_mask_from_expr(expr, table_references, subqueries) {
+        Ok(mask) => table_references
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == table_reference.internal_id)
+            .is_some_and(|idx| mask.contains_table(idx) && mask.table_count() == 1),
+        Err(_) => false,
+    }
+}
+
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
 ///
@@ -188,6 +223,7 @@ pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -196,7 +232,7 @@ pub fn constraints_from_where_clause(
         let rowid_alias_column = table_reference
             .columns()
             .iter()
-            .position(|c| c.is_rowid_alias);
+            .position(|c| c.is_rowid_alias());
 
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
@@ -240,9 +276,10 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            table_col_pos: Some(*column),
+                            expr: None,
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
@@ -257,12 +294,30 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            table_col_pos: rowid_alias_column,
+                            expr: None,
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
+                }
+                _ if expression_matches_table(
+                    lhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator,
+                        table_col_pos: None,
+                        expr: Some(lhs.clone()),
+                        lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                        selectivity: SELECTIVITY_OTHER,
+                        usable: true,
+                    });
                 }
                 _ => {}
             };
@@ -273,9 +328,10 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
-                            table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            table_col_pos: Some(*column),
+                            expr: None,
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
@@ -287,12 +343,30 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            table_col_pos: rowid_alias_column,
+                            expr: None,
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
+                }
+                _ if expression_matches_table(
+                    rhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Lhs),
+                        operator: opposite_cmp_op(operator),
+                        table_col_pos: None,
+                        expr: Some(rhs.clone()),
+                        lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                        selectivity: SELECTIVITY_OTHER,
+                        usable: true,
+                    });
                 }
                 _ => {}
             };
@@ -311,19 +385,24 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
-            let constrained_column = &table_reference.table.columns()[constraint.table_col_pos];
-            let column_collation = constrained_column.collation.unwrap_or_default();
+            let constrained_column = constraint
+                .table_col_pos
+                .and_then(|pos| table_reference.table.columns().get(pos));
+            let column_collation = constrained_column.map(|c| c.collation());
             let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
             // Index seek keys must use the same collation as the constrained column.
-            match get_collseq_from_expr(constraining_expr, table_references)? {
-                Some(collation) if collation != column_collation => {
+            match (
+                get_collseq_from_expr(constraining_expr, table_references)?,
+                column_collation,
+            ) {
+                (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
                 }
                 _ => {}
             }
 
-            if rowid_alias_column == Some(constraint.table_col_pos) {
+            if rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p)) {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
@@ -345,9 +424,14 @@ pub fn constraints_from_where_clause(
                 .get(table_reference.table.get_name())
                 .unwrap_or(&VecDeque::new())
             {
-                if let Some(position_in_index) =
-                    index.column_table_pos_to_index_pos(constraint.table_col_pos)
-                {
+                if let Some(position_in_index) = match constraint.table_col_pos {
+                    Some(pos) => index.column_table_pos_to_index_pos(pos),
+                    None => constraint.expr.as_ref().and_then(|e| {
+                        let normalized =
+                            normalize_expr_for_index_matching(e, table_reference, table_references);
+                        index.expression_to_index_pos(&normalized)
+                    }),
+                } {
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
                             Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
@@ -398,7 +482,7 @@ pub fn constraints_from_where_clause(
 /// eq, lower_bound and upper_bound holds None or position of the constraint in the [Constraint] array
 pub struct RangeConstraintRef {
     /// position of the column in the table definition
-    pub table_col_pos: usize,
+    pub table_col_pos: Option<usize>,
     /// position of the column in the index definition
     pub index_col_pos: usize,
     /// sort order for the column in the index definition
@@ -415,13 +499,13 @@ pub struct RangeConstraintRef {
 /// Represent seek range which can be used in query planning to emit range scan over table or index
 pub struct SeekRangeConstraint {
     pub sort_order: SortOrder,
-    pub eq: Option<(ast::Operator, ast::Expr)>,
-    pub lower_bound: Option<(ast::Operator, ast::Expr)>,
-    pub upper_bound: Option<(ast::Operator, ast::Expr)>,
+    pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
 }
 
 impl SeekRangeConstraint {
-    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr)) -> Self {
+    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
         Self {
             sort_order,
             eq: Some(eq),
@@ -431,8 +515,8 @@ impl SeekRangeConstraint {
     }
     pub fn new_range(
         sort_order: SortOrder,
-        lower_bound: Option<(ast::Operator, ast::Expr)>,
-        upper_bound: Option<(ast::Operator, ast::Expr)>,
+        lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+        upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
         assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
@@ -450,19 +534,20 @@ impl RangeConstraintRef {
         &self,
         constraints: &[Constraint],
         where_clause: &[WhereTerm],
+        referenced_tables: Option<&TableReferences>,
     ) -> SeekRangeConstraint {
         if let Some(eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
-                constraints[eq].get_constraining_expr(where_clause),
+                constraints[eq].get_constraining_expr(where_clause, referenced_tables),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
             self.lower_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
             self.upper_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
         )
     }
 }
@@ -603,13 +688,14 @@ pub fn convert_to_vtab_constraint(
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
+            let table_col_pos = constraint.table_col_pos?;
             let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
             if other_side_refers_to_self {
                 return None;
             }
             let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
             to_ext_constraint_op(&constraint.operator).map(|op| ConstraintInfo {
-                column_index: constraint.table_col_pos as u32,
+                column_index: table_col_pos as u32,
                 op,
                 usable: all_required_tables_are_on_left_side,
                 index: i,
