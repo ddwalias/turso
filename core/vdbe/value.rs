@@ -183,8 +183,13 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_lowercase()))
+        match self {
+            Value::Text(t) => Some(Value::build_text(t.as_str().to_ascii_lowercase())),
+            Value::Null => None,
+            _ => self
+                .cast_text()
+                .map(|s| Value::build_text(s.to_ascii_lowercase())),
+        }
     }
 
     pub fn exec_length(&self) -> Self {
@@ -216,8 +221,13 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_uppercase()))
+        match self {
+            Value::Text(t) => Some(Value::build_text(t.as_str().to_ascii_uppercase())),
+            Value::Null => None,
+            _ => self
+                .cast_text()
+                .map(|s| Value::build_text(s.to_ascii_uppercase())),
+        }
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
@@ -571,7 +581,8 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) => {
+            Value::Text(t) => Value::build_text(hex::encode_upper(t.as_str())),
+            Value::Numeric(_) => {
                 let text = self.to_string();
                 Value::build_text(hex::encode_upper(text))
             }
@@ -584,21 +595,29 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self
-                    .cast_text()
-                    .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
-                {
-                    Some(Ok(bytes)) => Value::Blob(bytes),
-                    _ => Value::Null,
-                },
+                None => {
+                    let s = match self {
+                        Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+                        _ => match self.cast_text() {
+                            Some(s) => std::borrow::Cow::Owned(s),
+                            None => return Value::Null,
+                        },
+                    };
+                    match hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]) {
+                        Ok(bytes) => Value::Blob(bytes),
+                        _ => Value::Null,
+                    }
+                }
                 Some(ignore) => match ignore {
-                    Value::Text(_) => {
-                        let pat = ignore.to_string();
-                        let trimmed = self
-                            .to_string()
+                    Value::Text(pat_text) => {
+                        let pat = pat_text.as_str();
+                        let self_str = match self {
+                            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+                            _ => std::borrow::Cow::Owned(self.to_string()),
+                        };
+                        let trimmed = self_str
                             .trim_start_matches(|x| pat.contains(x))
-                            .trim_end_matches(|x| pat.contains(x))
-                            .to_string();
+                            .trim_end_matches(|x| pat.contains(x));
                         match hex::decode(trimmed) {
                             Ok(bytes) => Value::Blob(bytes),
                             _ => Value::Null,
@@ -612,7 +631,14 @@ impl Value {
 
     pub fn exec_unicode(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
+            Value::Text(t) => {
+                if let Some(first_char) = t.as_str().chars().next() {
+                    Value::from_i64(first_char as u32 as i64)
+                } else {
+                    Value::Null
+                }
+            }
+            Value::Numeric(_) | Value::Blob(_) => {
                 let text = self.to_string();
                 if let Some(first_char) = text.chars().next() {
                     Value::from_i64(first_char as u32 as i64)
@@ -802,24 +828,28 @@ impl Value {
             return Value::Null;
         }
 
-        let source = source.exec_cast("TEXT");
-        let pattern = pattern.exec_cast("TEXT");
-        let replacement = replacement.exec_cast("TEXT");
+        let source_cow = match source {
+            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            _ => std::borrow::Cow::Owned(source.to_string()),
+        };
+        let pattern_cow = match pattern {
+            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            _ => std::borrow::Cow::Owned(pattern.to_string()),
+        };
+        let replacement_cow = match replacement {
+            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            _ => std::borrow::Cow::Owned(replacement.to_string()),
+        };
 
-        // If any of the casts failed, panic as text casting is not expected to fail.
-        match (&source, &pattern, &replacement) {
-            (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
-                    return Value::Text(source.clone());
-                }
-
-                let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
-                Value::build_text(result)
-            }
-            _ => unreachable!("text cast should never fail"),
+        if pattern_cow.is_empty() || pattern_cow.starts_with('\0') {
+            return match source {
+                Value::Text(_) => source.clone(),
+                _ => Value::build_text(source_cow.into_owned()),
+            };
         }
+
+        let result = source_cow.replace(pattern_cow.as_ref(), replacement_cow.as_ref());
+        Value::build_text(result)
     }
 
     pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
